@@ -9,6 +9,7 @@ const FAVORITES_KEY = '@youanime/favorites';
 const WATCHED_KEY = '@youanime/watched';
 const PROGRESS_KEY = '@youanime/progress';
 const CUSTOM_SOURCES_KEY = '@youanime/custom_sources';
+const ACCESS_PIN_KEY = '@youanime/access_pin';
 
 function resolveDefaultBackendUrl(): string {
   if (Platform.OS === 'web') {
@@ -32,6 +33,8 @@ export interface WatchProgress {
   position: number;
   duration: number;
   updatedAt: number;
+  title?: string;
+  thumbnail?: string;
 }
 
 export async function loadBackendUrl(): Promise<string> {
@@ -85,6 +88,10 @@ export async function toggleFavorite(entry: HistoryEntry): Promise<HistoryEntry[
   return next;
 }
 
+export async function saveFavoritesList(list: HistoryEntry[]): Promise<void> {
+  await AsyncStorage.setItem(FAVORITES_KEY, JSON.stringify(list));
+}
+
 export async function loadWatchedEpisodes(): Promise<string[]> {
   const raw = await AsyncStorage.getItem(WATCHED_KEY);
   if (!raw) return [];
@@ -117,11 +124,27 @@ export async function savePlaybackProgress(
   url: string,
   position: number,
   duration: number,
+  meta?: { title?: string; thumbnail?: string },
 ): Promise<void> {
   if (!url || duration <= 0) return;
   const current = await loadPlaybackProgress();
-  current[url] = { position, duration, updatedAt: Date.now() };
+  const prev = current[url];
+  current[url] = {
+    position,
+    duration,
+    updatedAt: Date.now(),
+    title: meta?.title ?? prev?.title,
+    thumbnail: meta?.thumbnail ?? prev?.thumbnail,
+  };
   await AsyncStorage.setItem(PROGRESS_KEY, JSON.stringify(current));
+}
+
+export async function loadAccessPin(): Promise<string> {
+  return (await AsyncStorage.getItem(ACCESS_PIN_KEY)) || '';
+}
+
+export async function saveAccessPin(pin: string): Promise<void> {
+  await AsyncStorage.setItem(ACCESS_PIN_KEY, pin.trim());
 }
 
 export async function loadCustomSources(): Promise<FixedSource[]> {

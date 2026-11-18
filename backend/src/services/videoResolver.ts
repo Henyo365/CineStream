@@ -21,31 +21,46 @@ export interface ResolvedVideo {
  * Unpacks Dean Edwards p,a,c,k,e,d JavaScript blocks without eval().
  */
 export function unpackPacker(html: string): string | null {
-  const m = html.match(
-    /eval\(function\(p,a,c,k,e,[dr]\)\{[\s\S]*?\}\('([\s\S]*?)',(\d+),(\d+),'([^']*)'\.split\('\|'\)/,
-  );
-  if (!m) return null;
-  const [, p, aStr, cStr, kStr] = m;
-  const a = parseInt(aStr, 10);
-  let c = parseInt(cStr, 10);
-  const k = kStr.split('|');
+  const all = unpackAllPackers(html);
+  return all.length > 0 ? all.join('\n') : null;
+}
 
-  const toBase = (num: number, radix: number): string => {
-    const first = num < radix ? '' : toBase(Math.floor(num / radix), radix);
-    const rem = num % radix;
-    return first + (rem > 35 ? String.fromCharCode(rem + 29) : rem.toString(36));
-  };
+export function unpackAllPackers(html: string): string[] {
+  const results: string[] = [];
+  const rx =
+    /eval\(function\(p,a,c,k,e,[dr]\)\{[\s\S]*?\}\('([\s\S]*?)',(\d+),(\d+),'([^']*)'\.split\('\|'\)/g;
+  let m: RegExpExecArray | null;
+  while ((m = rx.exec(html)) !== null) {
+    const [, p, aStr, cStr, kStr] = m;
+    const a = parseInt(aStr, 10);
+    let c = parseInt(cStr, 10);
+    const k = kStr.split('|');
 
-  const dict: Record<string, string> = {};
-  while (c--) {
-    const key = toBase(c, a);
-    dict[key] = k[c] || key;
+    const toBase = (num: number, radix: number): string => {
+      const first = num < radix ? '' : toBase(Math.floor(num / radix), radix);
+      const rem = num % radix;
+      return first + (rem > 35 ? String.fromCharCode(rem + 29) : rem.toString(36));
+    };
+
+    const dict: Record<string, string> = {};
+    while (c--) {
+      const key = toBase(c, a);
+      dict[key] = k[c] || key;
+    }
+
+    results.push(p.replace(/\b\w+\b/g, (w) => dict[w] ?? w));
   }
-
-  return p.replace(/\b\w+\b/g, (w) => dict[w] ?? w);
+  return results;
 }
 
 function extractDirectStreamFromText(text: string): { url: string; mimeType: string } | null {
+  // Mixdrop MDCore.wurl = "//..."
+  const mdCore = text.match(/MDCore\.wurl\s*=\s*["']((?:https?:)?\/\/[^"']+)["']/i);
+  if (mdCore?.[1]) {
+    const url = mdCore[1].startsWith('//') ? `https:${mdCore[1]}` : mdCore[1];
+    return { url, mimeType: 'video/mp4' };
+  }
+
   const m3u8 = text.match(/https?:\/\/[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*/i);
   if (m3u8?.[0]) {
     return { url: m3u8[0], mimeType: 'application/x-mpegURL' };
@@ -76,7 +91,62 @@ function extractSubtitlesFromText(text: string): SubtitleOption[] {
   return subs;
 }
 
-export async function resolveVideoStream(rawUrl: string): Promise<ResolvedVideo> {
+/**
+ * Decodes VOE's obfuscated <script type="application/json">["..."]</script> payload.
+ */
+export function decodeVoePayload(
+  html: string,
+): { streamUrl: string; mimeType: string; subtitles?: SubtitleOption[] } | null {
+  const m = html.match(
+    /<script[^>]*type=["']application\/json["'][^>]*>\s*\["([^"]+)"\]\s*<\/script>/i,
+  );
+  if (!m?.[1]) return null;
+  try {
+    let s = m[1];
+    // 1. ROT13
+    s = s.replace(/[a-zA-Z]/g, (c) =>
+      String.fromCharCode(
+        (c <= 'Z' ? 90 : 122) >= c.charCodeAt(0) + 13
+          ? c.charCodeAt(0) + 13
+          : c.charCodeAt(0) - 13,
+      ),
+    );
+    // 2. Strip junk markers
+    s = s.replace(/(@\$|\^\^|~@|#&|!!|%\?|\*~)/g, '');
+    // 3. Base64 decode
+    s = Buffer.from(s, 'base64').toString('latin1');
+    // 4. Shift -3
+    s = Array.from(s, (ch) => String.fromCharCode(ch.charCodeAt(0) - 3)).join('');
+    // 5. Reverse + Base64 decode
+    s = Buffer.from(s.split('').reverse().join(''), 'base64').toString('utf8');
+
+    const obj = JSON.parse(s) as {
+      source?: string;
+      direct_access_url?: string;
+      captions?: Array<{ file?: string; label?: string }>;
+    };
+    const streamUrl = obj.source || obj.direct_access_url;
+    if (!streamUrl) return null;
+
+    const mimeType = streamUrl.includes('.m3u8') ? 'application/x-mpegURL' : 'video/mp4';
+    const subtitles = (obj.captions ?? [])
+      .filter((c): c is { file: string; label?: string } => Boolean(c.file))
+      .map((c, idx) => ({
+        url: c.file,
+        label: c.label || `Subtítulo ${idx + 1}`,
+      }));
+
+    return {
+      streamUrl,
+      mimeType,
+      subtitles: subtitles.length > 0 ? subtitles : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function resolveVideoStream(rawUrl: string, depth = 0): Promise<ResolvedVideo> {
   const target = validateTargetUrl(rawUrl);
   const urlStr = target.toString();
   const host = target.hostname.toLowerCase();
@@ -102,7 +172,7 @@ export async function resolveVideoStream(rawUrl: string): Promise<ResolvedVideo>
   }
 
   // hackstore.fo/play.php: extraer la URL real dentro de function don()
-  if (host.includes('hackstore.') && target.pathname.includes('play.php')) {
+  if (host.includes('hackstore.') && target.pathname.includes('play.php') && depth < 2) {
     const res = await fetch(urlStr, {
       headers: {
         'User-Agent': DEFAULT_UA,
@@ -115,7 +185,7 @@ export async function resolveVideoStream(rawUrl: string): Promise<ResolvedVideo>
       const html = await res.text();
       const match = html.match(/window\.location\.href\s*=\s*['"](https?:\/\/[^'"]+)['"]/i);
       if (match?.[1]) {
-        return resolveVideoStream(match[1]);
+        return resolveVideoStream(match[1], depth + 1);
       }
     }
   }
@@ -144,7 +214,7 @@ export async function resolveVideoStream(rawUrl: string): Promise<ResolvedVideo>
     }
   }
 
-  // Generic embed resolver: try extracting direct .m3u8 / .mp4 from HTML or packed JS (e.g. vimeos.net)
+  // Generic embed resolver: vimeos, streamwish, filemoon, vidhide, mixdrop, voe redirect
   if (!host.includes('youtube.com') && !host.includes('youtu.be')) {
     try {
       const res = await fetch(urlStr, {
@@ -164,6 +234,28 @@ export async function resolveVideoStream(rawUrl: string): Promise<ResolvedVideo>
               'Este servidor no tiene el video disponible. Prueba otro servidor.',
           };
         }
+
+        // Follow single JS redirect (e.g. voe.sx -> mirror domain)
+        if (depth < 2 && html.length < 4000) {
+          const jsRedirect = html.match(
+            /window\.location\.href\s*=\s*['"](https?:\/\/[^'"]+)['"]/i,
+          );
+          if (jsRedirect?.[1] && jsRedirect[1] !== urlStr) {
+            return resolveVideoStream(jsRedirect[1], depth + 1);
+          }
+        }
+
+        const voe = decodeVoePayload(html);
+        if (voe) {
+          return {
+            streamUrl: voe.streamUrl,
+            referer: `${target.origin}/`,
+            mimeType: voe.mimeType,
+            isEmbed: false,
+            subtitles: voe.subtitles,
+          };
+        }
+
         const unpacked = unpackPacker(html);
         const found =
           (unpacked ? extractDirectStreamFromText(unpacked) : null) ??

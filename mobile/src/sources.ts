@@ -40,4 +40,16 @@ export const FIXED_SOURCES: FixedSource[] = [
       { label: 'Animes', url: 'https://www.hackstore.fo/animes/' },
     ],
   },
+  {
+    id: 'lectortmo',
+    name: 'LectorTMO',
+    url: 'https://lectortmo.vip/',
+    searchUrlTemplate: 'https://lectortmo.vip/manga/?s={q}',
+    description: 'Lector de mangas, manhwas y cómics en cascada vertical',
+    color: '#a855f7',
+    sections: [
+      { label: 'Inicio', url: 'https://lectortmo.vip/' },
+      { label: 'Biblioteca', url: 'https://lectortmo.vip/manga/' },
+    ],
+  },
 ];

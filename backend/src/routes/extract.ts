@@ -6,27 +6,34 @@ import { extractFilename, makeMediaId, validateTargetUrl } from '../utils/url.js
 
 export const extractRouter = Router();
 
-async function handleExtract(rawUrl: unknown, res: Response): Promise<void> {
-  if (typeof rawUrl !== 'string' || !rawUrl.trim()) {
-    res.status(400).json({ error: 'Falta el parámetro "url"' });
-    return;
+const CACHE_TTL_MS = 5 * 60 * 1000;
+const MAX_CACHE_ENTRIES = 100;
+const extractCache = new Map<string, { data: ExtractionResult; expiresAt: number }>();
+
+export async function extractUrl(
+  rawUrl: string,
+  bypassCache = false,
+): Promise<ExtractionResult> {
+  const targetUrl = validateTargetUrl(rawUrl);
+  const cacheKey = targetUrl.toString();
+
+  if (!bypassCache) {
+    const cached = extractCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.data;
+    }
   }
 
-  try {
-    const targetUrl = validateTargetUrl(rawUrl);
-    const fetched = await fetchTargetPage(targetUrl);
+  const fetched = await fetchTargetPage(targetUrl);
+  let result: ExtractionResult;
 
-    if (fetched.html !== undefined) {
-      const result = extractFromHtml(fetched.finalUrl, fetched.html);
-      res.json(result);
-      return;
-    }
-
-    // Direct media file URL (PDF, video, or image)
+  if (fetched.html !== undefined) {
+    result = extractFromHtml(fetched.finalUrl, fetched.html);
+  } else {
     const ct = fetched.contentType;
     const urlStr = fetched.finalUrl.toString();
     const filename = extractFilename(urlStr) || fetched.finalUrl.hostname;
-    const baseResult: ExtractionResult = {
+    result = {
       adapter: 'direct-media',
       metadata: {
         title: filename,
@@ -40,7 +47,7 @@ async function handleExtract(rawUrl: unknown, res: Response): Promise<void> {
     };
 
     if (ct.includes('pdf')) {
-      baseResult.pdfs.push({
+      result.pdfs.push({
         id: makeMediaId(urlStr),
         type: 'pdf',
         url: urlStr,
@@ -49,7 +56,7 @@ async function handleExtract(rawUrl: unknown, res: Response): Promise<void> {
         sourceTag: 'direct',
       });
     } else if (ct.startsWith('video/')) {
-      baseResult.videos.push({
+      result.videos.push({
         id: makeMediaId(urlStr),
         type: 'video',
         url: urlStr,
@@ -58,7 +65,7 @@ async function handleExtract(rawUrl: unknown, res: Response): Promise<void> {
         sourceTag: 'direct',
       });
     } else if (ct.startsWith('image/')) {
-      baseResult.images.push({
+      result.images.push({
         id: makeMediaId(urlStr),
         type: 'image',
         url: urlStr,
@@ -67,8 +74,33 @@ async function handleExtract(rawUrl: unknown, res: Response): Promise<void> {
         sourceTag: 'direct',
       });
     }
+  }
 
-    res.json(baseResult);
+  if (extractCache.size >= MAX_CACHE_ENTRIES) {
+    const firstKey = extractCache.keys().next().value;
+    if (firstKey) extractCache.delete(firstKey);
+  }
+  extractCache.set(cacheKey, {
+    data: result,
+    expiresAt: Date.now() + CACHE_TTL_MS,
+  });
+
+  return result;
+}
+
+async function handleExtract(
+  rawUrl: unknown,
+  bypassCache: boolean,
+  res: Response,
+): Promise<void> {
+  if (typeof rawUrl !== 'string' || !rawUrl.trim()) {
+    res.status(400).json({ error: 'Falta el parámetro "url"' });
+    return;
+  }
+
+  try {
+    const result = await extractUrl(rawUrl, bypassCache);
+    res.json(result);
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Error al procesar la URL';
     res.status(422).json({ error: message });
@@ -76,10 +108,12 @@ async function handleExtract(rawUrl: unknown, res: Response): Promise<void> {
 }
 
 extractRouter.get('/', (req: Request, res: Response) => {
-  void handleExtract(req.query.url, res);
+  const refresh = req.query.refresh === 'true' || req.query.refresh === '1';
+  void handleExtract(req.query.url, refresh, res);
 });
 
 extractRouter.post('/', (req: Request, res: Response) => {
-  const bodyUrl = (req.body as { url?: unknown } | undefined)?.url;
-  void handleExtract(bodyUrl, res);
+  const body = req.body as { url?: unknown; refresh?: unknown } | undefined;
+  const refresh = Boolean(body?.refresh);
+  void handleExtract(body?.url, refresh, res);
 });

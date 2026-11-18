@@ -14,26 +14,30 @@ import { checkBackendHealth } from '../services/api';
 interface SettingsModalProps {
   visible: boolean;
   currentUrl: string;
-  onSave: (newUrl: string) => void;
+  currentPin?: string;
+  onSave: (newUrl: string, newPin: string) => void;
   onClose: () => void;
 }
 
 export function SettingsModal({
   visible,
   currentUrl,
+  currentPin = '',
   onSave,
   onClose,
 }: SettingsModalProps) {
   const [url, setUrl] = useState(currentUrl);
+  const [pin, setPin] = useState(currentPin);
   const [testing, setTesting] = useState(false);
   const [status, setStatus] = useState<'idle' | 'ok' | 'fail'>('idle');
 
   useEffect(() => {
     if (visible) {
       setUrl(currentUrl);
+      setPin(currentPin);
       setStatus('idle');
     }
-  }, [visible, currentUrl]);
+  }, [visible, currentUrl, currentPin]);
 
   const handleTest = async () => {
     setTesting(true);
@@ -44,7 +48,7 @@ export function SettingsModal({
   };
 
   const handleSave = () => {
-    onSave(url.trim().replace(/\/+$/, ''));
+    onSave(url.trim().replace(/\/+$/, ''), pin.trim());
     onClose();
   };
 
@@ -76,6 +80,19 @@ export function SettingsModal({
             autoCapitalize="none"
             autoCorrect={false}
             keyboardType="url"
+          />
+
+          <Text style={styles.help}>
+            PIN de acceso (opcional, solo si configuraste ACCESS_PIN en Railway):
+          </Text>
+          <TextInput
+            style={styles.input}
+            value={pin}
+            onChangeText={setPin}
+            placeholder="PIN opcional"
+            placeholderTextColor="#71717a"
+            secureTextEntry
+            autoCapitalize="none"
           />
 
           {status === 'ok' && (

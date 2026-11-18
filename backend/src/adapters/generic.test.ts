@@ -151,3 +151,39 @@ test('unpackPacker decodes Dean Edwards packed JS containing HLS stream URL', ()
   const unpacked = unpackPacker(packed);
   assert.equal(unpacked, 'var url="https://cdn.example/master.m3u8";');
 });
+
+test('lectortmoAdapter extracts manga detail chapters and chapter reader images', () => {
+  const detailUrl = new URL('https://lectortmo.vip/manga/las-flores-son-cebo/');
+  const detailHtml = `
+    <html>
+      <body>
+        <h1>Las Flores Son Cebo</h1>
+        <div class="summary_image"><img src="https://lectortmo.vip/wp-content/uploads/2026/08/cover.webp" /></div>
+        <div class="description-summary"><p>Esta es una sinopsis suficientemente larga para ser extraída correctamente por el adaptador de LectorTMO.</p></div>
+        <a href="https://lectortmo.vip/manga-chapter/las-flores-son-cebo-capitulo-1/">Capítulo 1</a>
+      </body>
+    </html>
+  `;
+  const detail = extractFromHtml(detailUrl, detailHtml);
+  assert.equal(detail.adapter, 'lectortmo');
+  assert.equal(detail.metadata.title, 'Las Flores Son Cebo');
+  assert.equal(detail.pages.length, 1);
+  assert.equal(detail.pages[0].title, 'Capítulo 1');
+
+  const chapUrl = new URL('https://lectortmo.vip/manga-chapter/las-flores-son-cebo-capitulo-1/');
+  const chapHtml = `
+    <html>
+      <body>
+        <h1>Las Flores Son Cebo - Capítulo 1</h1>
+        <div class="reading-content">
+          <img src="https://repelishd.onl/mangax/001.webp" />
+          <img src="https://repelishd.onl/mangax/002.webp" />
+        </div>
+      </body>
+    </html>
+  `;
+  const chap = extractFromHtml(chapUrl, chapHtml);
+  assert.equal(chap.adapter, 'lectortmo');
+  assert.equal(chap.images.length, 2);
+  assert.equal(chap.images[0].url, 'https://repelishd.onl/mangax/001.webp');
+});

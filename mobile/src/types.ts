@@ -28,6 +28,7 @@ export interface PageLink {
   title: string;
   subtitle?: string;
   thumbnail?: string;
+  group?: string;
 }
 
 export interface ExtractionResult {
@@ -43,6 +44,7 @@ export interface ExtractionResult {
 export interface HistoryEntry {
   url: string;
   title: string;
+  thumbnail?: string;
   savedAt: number;
   counts: {
     videos: number;

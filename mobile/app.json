@@ -26,6 +26,11 @@
     "plugins": [
       "expo-video",
       "expo-screen-orientation"
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "64855358-b304-41c1-893d-68baf452d350"
+      }
+    }
   }
 }

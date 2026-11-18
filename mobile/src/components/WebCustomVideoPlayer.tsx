@@ -53,6 +53,7 @@ interface WebCustomVideoPlayerProps {
   referer?: string;
   episodeKey?: string;
   title: string;
+  posterThumbnail?: string;
   externalSubtitles?: SubtitleOption[];
   hasServers: boolean;
   onOpenServers: () => void;
@@ -71,6 +72,7 @@ export function WebCustomVideoPlayer({
   referer,
   episodeKey,
   title,
+  posterThumbnail,
   externalSubtitles,
   hasServers,
   onOpenServers,
@@ -108,6 +110,7 @@ export function WebCustomVideoPlayer({
   const [selectedHlsSubId, setSelectedHlsSubId] = useState<number>(-1);
   const [selectedExtSubUrl, setSelectedExtSubUrl] = useState<string | null>(null);
   const [extCues, setExtCues] = useState<SubtitleCue[]>([]);
+  const [nextCountdown, setNextCountdown] = useState<number | null>(null);
 
   const restoredRef = useRef(false);
   const watchedMarkedRef = useRef(false);
@@ -164,7 +167,15 @@ export function WebCustomVideoPlayer({
     };
 
     if (isHls && Hls.isSupported()) {
-      hls = new Hls({ startLevel: -1 });
+      hls = new Hls({
+        startLevel: -1,
+        maxBufferLength: 60,
+        maxMaxBufferLength: 120,
+        backBufferLength: 30,
+        fragLoadingTimeOut: 20000,
+        fragLoadingMaxRetry: 6,
+        fragLoadingRetryDelay: 500,
+      });
       hlsRef.current = hls;
       hls.loadSource(uri);
       hls.attachMedia(video);
@@ -179,8 +190,10 @@ export function WebCustomVideoPlayer({
               bestIdx = i;
             }
           });
-          hls.currentLevel = bestIdx;
-          setSelectedLevelId(bestIdx);
+          // Start at highest resolution while keeping Auto ABR (-1) so playback doesn't stall
+          hls.startLevel = bestIdx;
+          hls.currentLevel = -1;
+          setSelectedLevelId(-1);
         }
         if (hls) syncTracks(hls);
         void video.play().catch(() => {});
@@ -203,6 +216,11 @@ export function WebCustomVideoPlayer({
     const onPlay = () => setIsPlaying(true);
     const onPause = () => setIsPlaying(false);
     const onWaiting = () => setIsBuffering(true);
+    const onEnded = () => {
+      if (hasNext) {
+        setNextCountdown(5);
+      }
+    };
     const onCanPlay = () => {
       setIsBuffering(false);
       setHasLoadedOnce(true);
@@ -230,7 +248,10 @@ export function WebCustomVideoPlayer({
       setHasLoadedOnce(true);
       if (episodeKey && dur > 0) {
         if (Math.floor(ct) % 5 === 0 && ct > 2) {
-          void savePlaybackProgress(episodeKey, ct, dur);
+          void savePlaybackProgress(episodeKey, ct, dur, {
+            title,
+            thumbnail: posterThumbnail,
+          });
         }
         if (!watchedMarkedRef.current && ct / dur >= 0.8) {
           watchedMarkedRef.current = true;
@@ -242,6 +263,7 @@ export function WebCustomVideoPlayer({
     video.addEventListener('play', onPlay);
     video.addEventListener('pause', onPause);
     video.addEventListener('waiting', onWaiting);
+    video.addEventListener('ended', onEnded);
     video.addEventListener('canplay', onCanPlay);
     video.addEventListener('playing', onCanPlay);
     video.addEventListener('timeupdate', onTimeUpdate);
@@ -250,6 +272,7 @@ export function WebCustomVideoPlayer({
       video.removeEventListener('play', onPlay);
       video.removeEventListener('pause', onPause);
       video.removeEventListener('waiting', onWaiting);
+      video.removeEventListener('ended', onEnded);
       video.removeEventListener('canplay', onCanPlay);
       video.removeEventListener('playing', onCanPlay);
       video.removeEventListener('timeupdate', onTimeUpdate);
@@ -259,6 +282,50 @@ export function WebCustomVideoPlayer({
       }
     };
   }, [uri, isHls, episodeKey, onWatched]);
+
+  useEffect(() => {
+    if (nextCountdown === null) return;
+    if (nextCountdown <= 0) {
+      setNextCountdown(null);
+      onNext?.();
+      return;
+    }
+    const t = setTimeout(() => setNextCountdown((c) => (c !== null ? c - 1 : null)), 1000);
+    return () => clearTimeout(t);
+  }, [nextCountdown, onNext]);
+
+  // Web keyboard shortcuts (Space, Arrows, F, M)
+  useEffect(() => {
+    if (typeof globalThis.window === 'undefined') return;
+    const onKeyDown = (ev: KeyboardEvent) => {
+      const tag = (ev.target as HTMLElement | null)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+      if (ev.code === 'Space' || ev.key === 'k' || ev.key === 'K') {
+        ev.preventDefault();
+        handleTogglePlay();
+      } else if (ev.key === 'ArrowLeft') {
+        ev.preventDefault();
+        handleSeekBy(-10);
+      } else if (ev.key === 'ArrowRight') {
+        ev.preventDefault();
+        handleSeekBy(10);
+      } else if (ev.key === 'ArrowUp') {
+        ev.preventDefault();
+        handleStepVolume(0.1);
+      } else if (ev.key === 'ArrowDown') {
+        ev.preventDefault();
+        handleStepVolume(-0.1);
+      } else if (ev.key === 'm' || ev.key === 'M') {
+        ev.preventDefault();
+        handleToggleMute();
+      } else if (ev.key === 'f' || ev.key === 'F') {
+        ev.preventDefault();
+        void handleToggleFullscreen();
+      }
+    };
+    globalThis.window.addEventListener('keydown', onKeyDown);
+    return () => globalThis.window.removeEventListener('keydown', onKeyDown);
+  });
 
   useEffect(() => {
     if (!selectedExtSubUrl) {
@@ -415,6 +482,31 @@ export function WebCustomVideoPlayer({
         {isBuffering && hasLoadedOnce && (
           <View style={styles.rebufferBadge} pointerEvents="none">
             <ActivityIndicator size="small" color="#ffffff" />
+          </View>
+        )}
+
+        {nextCountdown !== null && (
+          <View style={styles.nextUpBanner}>
+            <Text style={styles.nextUpText}>
+              Siguiente episodio en {nextCountdown}s...
+            </Text>
+            <View style={{ flexDirection: 'row', gap: 8 }}>
+              <TouchableOpacity
+                style={styles.playerPillBtn}
+                onPress={() => setNextCountdown(null)}
+              >
+                <Text style={styles.playerPillText}>Cancelar</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.playerPillBtn, { backgroundColor: '#4f46e5' }]}
+                onPress={() => {
+                  setNextCountdown(null);
+                  onNext?.();
+                }}
+              >
+                <Text style={styles.playerPillText}>Ver ahora</Text>
+              </TouchableOpacity>
+            </View>
           </View>
         )}
 
@@ -811,6 +903,23 @@ const styles = StyleSheet.create({
     padding: 8,
     borderRadius: 20,
     backgroundColor: 'rgba(0,0,0,0.6)',
+  },
+  nextUpBanner: {
+    position: 'absolute',
+    bottom: 84,
+    right: 20,
+    backgroundColor: 'rgba(20, 22, 32, 0.92)',
+    borderRadius: 14,
+    padding: 14,
+    gap: 10,
+    borderWidth: 1,
+    borderColor: '#4f46e5',
+    zIndex: 25,
+  },
+  nextUpText: {
+    color: '#f8fafc',
+    fontSize: 13.5,
+    fontWeight: '600',
   },
   loadingOverlay: {
     ...StyleSheet.absoluteFill,

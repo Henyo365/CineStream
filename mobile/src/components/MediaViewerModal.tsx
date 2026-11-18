@@ -1,5 +1,5 @@
 import { Ionicons } from '@expo/vector-icons';
-import { useEvent } from 'expo';
+import { useEvent, useEventListener } from 'expo';
 import { File, Paths } from 'expo-file-system';
 import * as ScreenOrientation from 'expo-screen-orientation';
 import * as Sharing from 'expo-sharing';
@@ -39,7 +39,10 @@ import { WebCustomVideoPlayer } from './WebCustomVideoPlayer';
 interface MediaViewerModalProps {
   item: MediaItem | null;
   backendUrl: string;
+  accessPin?: string;
   referer?: string;
+  episodeTitle?: string;
+  episodeThumbnail?: string;
   serverOptions?: MediaItem[];
   onSelectServer?: (server: MediaItem) => void;
   hasPrevEpisode?: boolean;
@@ -257,9 +260,12 @@ function CustomNativePlayer({
   uri,
   isHls,
   backendUrl,
+  accessPin,
   referer,
   episodeKey,
   title,
+  progressTitle,
+  posterThumbnail,
   externalSubtitles,
   hasServers,
   onOpenServers,
@@ -274,9 +280,12 @@ function CustomNativePlayer({
   uri: string;
   isHls: boolean;
   backendUrl: string;
+  accessPin?: string;
   referer?: string;
   episodeKey?: string;
   title: string;
+  progressTitle?: string;
+  posterThumbnail?: string;
   externalSubtitles?: SubtitleOption[];
   hasServers: boolean;
   onOpenServers: () => void;
@@ -308,6 +317,7 @@ function CustomNativePlayer({
   const [selectedExtSubUrl, setSelectedExtSubUrl] = useState<string | null>(null);
   const [extCues, setExtCues] = useState<SubtitleCue[]>([]);
   const [videoTracks, setVideoTracks] = useState<VideoTrack[]>([]);
+  const [nextCountdown, setNextCountdown] = useState<number | null>(null);
 
   const restoredRef = useRef(false);
   const watchedMarkedRef = useRef(false);
@@ -338,6 +348,11 @@ function CustomNativePlayer({
   const player = useVideoPlayer(videoSource, (p) => {
     p.loop = false;
     p.timeUpdateEventInterval = 1;
+    p.bufferOptions = {
+      preferredForwardBufferDuration: 60,
+      minBufferForPlayback: 3,
+      waitsToMinimizeStalling: true,
+    };
     p.play();
   });
 
@@ -415,17 +430,37 @@ function CustomNativePlayer({
     }
   }, [status, episodeKey, player]);
 
+  useEventListener(player, 'playToEnd', () => {
+    if (hasNext) {
+      setNextCountdown(5);
+    }
+  });
+
+  useEffect(() => {
+    if (nextCountdown === null) return;
+    if (nextCountdown <= 0) {
+      setNextCountdown(null);
+      onNext?.();
+      return;
+    }
+    const t = setTimeout(() => setNextCountdown((c) => (c !== null ? c - 1 : null)), 1000);
+    return () => clearTimeout(t);
+  }, [nextCountdown, onNext]);
+
   // Save playback progress & mark watched at 80%
   useEffect(() => {
     if (!episodeKey || duration <= 0) return;
     if (Math.floor(currentTime) % 5 === 0 && currentTime > 2) {
-      void savePlaybackProgress(episodeKey, currentTime, duration);
+      void savePlaybackProgress(episodeKey, currentTime, duration, {
+        title: progressTitle || title,
+        thumbnail: posterThumbnail,
+      });
     }
     if (!watchedMarkedRef.current && currentTime / duration >= 0.8) {
       watchedMarkedRef.current = true;
       onWatched?.(episodeKey);
     }
-  }, [currentTime, duration, episodeKey, onWatched]);
+  }, [currentTime, duration, episodeKey, progressTitle, title, posterThumbnail, onWatched]);
 
   // Load external VTT cues when selected
   useEffect(() => {
@@ -434,7 +469,7 @@ function CustomNativePlayer({
       return;
     }
     let cancelled = false;
-    const proxiedSub = buildProxyUrl(backendUrl, selectedExtSubUrl, referer);
+    const proxiedSub = buildProxyUrl(backendUrl, selectedExtSubUrl, referer, accessPin);
     void fetch(proxiedSub)
       .then((r) => r.text())
       .then((txt) => {
@@ -608,6 +643,31 @@ function CustomNativePlayer({
       {status === 'loading' && hasLoadedOnce && (
         <View style={styles.rebufferBadge} pointerEvents="none">
           <ActivityIndicator size="small" color="#ffffff" />
+        </View>
+      )}
+
+      {nextCountdown !== null && (
+        <View style={styles.nextUpBanner}>
+          <Text style={styles.nextUpText}>
+            Siguiente episodio en {nextCountdown}s...
+          </Text>
+          <View style={{ flexDirection: 'row', gap: 8 }}>
+            <TouchableOpacity
+              style={styles.playerPillBtn}
+              onPress={() => setNextCountdown(null)}
+            >
+              <Text style={styles.playerPillText}>Cancelar</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.playerPillBtn, { backgroundColor: '#4f46e5' }]}
+              onPress={() => {
+                setNextCountdown(null);
+                onNext?.();
+              }}
+            >
+              <Text style={styles.playerPillText}>Ver ahora</Text>
+            </TouchableOpacity>
+          </View>
         </View>
       )}
 
@@ -944,7 +1004,10 @@ function CustomNativePlayer({
 export function MediaViewerModal({
   item,
   backendUrl,
+  accessPin,
   referer,
+  episodeTitle,
+  episodeThumbnail,
   serverOptions,
   onSelectServer,
   hasPrevEpisode,
@@ -963,6 +1026,23 @@ export function MediaViewerModal({
   const [resolvedSubtitles, setResolvedSubtitles] = useState<SubtitleOption[] | undefined>(undefined);
   const [serverMenuOpen, setServerMenuOpen] = useState(false);
   const [nativeError, setNativeError] = useState<string | null>(null);
+  const triedServerIdsRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    triedServerIdsRef.current.clear();
+  }, [referer]);
+
+  const tryNextServer = (fallbackError: string) => {
+    if (serverOptions && serverOptions.length > 1 && onSelectServer && item) {
+      triedServerIdsRef.current.add(item.id);
+      const nextSrv = serverOptions.find((s) => !triedServerIdsRef.current.has(s.id));
+      if (nextSrv) {
+        onSelectServer(nextSrv);
+        return;
+      }
+    }
+    setNativeError(fallbackError);
+  };
 
   useEffect(() => {
     setForceWebView(false);
@@ -977,16 +1057,32 @@ export function MediaViewerModal({
     let cancelled = false;
     setResolving(true);
     setResolvedUrl(null);
-    void resolveVideoUrl(backendUrl, item.url)
+    void resolveVideoUrl(backendUrl, item.url, accessPin)
       .then((res) => {
         if (cancelled) return;
+        if (res.unavailableReason) {
+          tryNextServer(res.unavailableReason);
+          return;
+        }
+        if (
+          res.isEmbed &&
+          serverOptions &&
+          serverOptions.length > 1 &&
+          !triedServerIdsRef.current.has(item.id)
+        ) {
+          const nextUntried = serverOptions.find(
+            (s) => s.id !== item.id && !triedServerIdsRef.current.has(s.id),
+          );
+          if (nextUntried) {
+            triedServerIdsRef.current.add(item.id);
+            onSelectServer?.(nextUntried);
+            return;
+          }
+        }
         setResolvedUrl(res.streamUrl);
         setResolvedReferer(res.referer ?? referer);
         setResolvedEmbed(res.isEmbed);
         setResolvedSubtitles(res.subtitles);
-        if (res.unavailableReason) {
-          setNativeError(res.unavailableReason);
-        }
       })
       .catch(() => {
         if (cancelled) return;
@@ -1001,13 +1097,13 @@ export function MediaViewerModal({
     return () => {
       cancelled = true;
     };
-  }, [item, backendUrl, referer]);
+  }, [item, backendUrl, accessPin, referer]);
 
   if (!item) return null;
 
   const activeUrl = resolvedUrl || item.url;
   const activeReferer = resolvedReferer ?? referer;
-  const proxiedUrl = buildProxyUrl(backendUrl, activeUrl, activeReferer);
+  const proxiedUrl = buildProxyUrl(backendUrl, activeUrl, activeReferer, accessPin);
 
   const handleDownloadAndShare = async () => {
     if (Platform.OS === 'web') {
@@ -1174,7 +1270,8 @@ export function MediaViewerModal({
             backendUrl={backendUrl}
             referer={activeReferer}
             episodeKey={referer}
-            title={item.title || 'Reproductor'}
+            title={episodeTitle || item.title || 'Reproductor'}
+            posterThumbnail={episodeThumbnail || item.thumbnail}
             externalSubtitles={resolvedSubtitles}
             hasServers={Boolean(serverOptions && serverOptions.length > 1)}
             onOpenServers={() => setServerMenuOpen(true)}
@@ -1193,9 +1290,12 @@ export function MediaViewerModal({
           uri={proxiedUrl}
           isHls={isHls}
           backendUrl={backendUrl}
+          accessPin={accessPin}
           referer={activeReferer}
           episodeKey={referer}
           title={item.title || 'Reproductor'}
+          progressTitle={episodeTitle || item.title}
+          posterThumbnail={episodeThumbnail || item.thumbnail}
           externalSubtitles={resolvedSubtitles}
           hasServers={Boolean(serverOptions && serverOptions.length > 1)}
           onOpenServers={() => setServerMenuOpen(true)}
@@ -1204,7 +1304,7 @@ export function MediaViewerModal({
           onPrev={onPrevEpisode}
           onNext={onNextEpisode}
           onWatched={onWatched}
-          onFallback={(msg) => setNativeError(msg || 'No se pudo reproducir este servidor')}
+          onFallback={(msg) => tryNextServer(msg || 'No se pudo reproducir este servidor')}
           onClose={onClose}
         />
       );
@@ -1413,6 +1513,23 @@ const styles = StyleSheet.create({
     padding: 8,
     borderRadius: 20,
     backgroundColor: 'rgba(0,0,0,0.6)',
+  },
+  nextUpBanner: {
+    position: 'absolute',
+    bottom: 84,
+    right: 20,
+    backgroundColor: 'rgba(20, 22, 32, 0.92)',
+    borderRadius: 14,
+    padding: 14,
+    gap: 10,
+    borderWidth: 1,
+    borderColor: '#4f46e5',
+    zIndex: 25,
+  },
+  nextUpText: {
+    color: '#f8fafc',
+    fontSize: 13.5,
+    fontWeight: '600',
   },
   playerOverlay: {
     ...StyleSheet.absoluteFill,

@@ -17,6 +17,27 @@ function decodeBase64Url(encoded: string | undefined): string | null {
   }
 }
 
+function formatDayGroupFromUrl(href: string): string | undefined {
+  const m = href.match(/\/(\d{4})\/(\d{2})\/(\d{2})\//);
+  if (!m) return undefined;
+  const year = parseInt(m[1], 10);
+  const month = parseInt(m[2], 10) - 1;
+  const day = parseInt(m[3], 10);
+  const itemDate = new Date(year, month, day);
+  if (Number.isNaN(itemDate.getTime())) return undefined;
+
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const diffDays = Math.round((today.getTime() - itemDate.getTime()) / (24 * 60 * 60 * 1000));
+
+  if (diffDays === 0) return 'Hoy';
+  if (diffDays === 1) return 'Ayer';
+
+  const weekdays = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
+  const months = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic'];
+  return `${weekdays[itemDate.getDay()]} ${day} ${months[month]}`;
+}
+
 export const animeflvAdapter: ExtractorAdapter = {
   name: 'animeflv',
 
@@ -172,6 +193,7 @@ export const animeflvAdapter: ExtractorAdapter = {
           title: cleanTitle,
           subtitle: epBadge || undefined,
           thumbnail: thumb,
+          group: formatDayGroupFromUrl(href),
         });
       });
     }

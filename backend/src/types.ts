@@ -28,6 +28,7 @@ export interface PageLink {
   title: string;
   subtitle?: string;
   thumbnail?: string;
+  group?: string;
 }
 
 export interface ExtractionResult {

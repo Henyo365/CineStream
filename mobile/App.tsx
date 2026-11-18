@@ -20,23 +20,30 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
+import { MangaReaderView } from './src/components/MangaReaderView';
 import { MediaViewerModal } from './src/components/MediaViewerModal';
 import { ServerPickerModal } from './src/components/ServerPickerModal';
 import { SettingsModal } from './src/components/SettingsModal';
-import { buildProxyUrl, extractMediaFromUrl } from './src/services/api';
+import { buildProxyUrl, extractMediaFromUrl, globalSearchMedia } from './src/services/api';
 import {
   addHistoryEntry,
   clearHistory,
   DEFAULT_BACKEND_URL,
+  loadAccessPin,
   loadBackendUrl,
   loadCustomSources,
   loadFavorites,
   loadHistory,
+  loadPlaybackProgress,
   loadWatchedEpisodes,
   markEpisodeWatched,
+  saveAccessPin,
   saveBackendUrl,
   saveCustomSources,
+  saveFavoritesList,
+  savePlaybackProgress,
   toggleFavorite,
+  type WatchProgress,
 } from './src/services/storage';
 import { FIXED_SOURCES, type FixedSource } from './src/sources';
 import type {
@@ -56,6 +63,7 @@ function MainScreen() {
   const gridColumns = windowWidth >= 1080 ? 6 : windowWidth >= 680 ? 4 : 3;
 
   const [backendUrl, setBackendUrl] = useState(DEFAULT_BACKEND_URL);
+  const [accessPin, setAccessPin] = useState('');
   const [activeSource, setActiveSource] = useState<FixedSource>(FIXED_SOURCES[0]);
   const [bottomTab, setBottomTab] = useState<BottomTab>('home');
 
@@ -67,6 +75,7 @@ function MainScreen() {
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ExtractionResult | null>(null);
   const [navStack, setNavStack] = useState<ExtractionResult[]>([]);
+  const [returnTab, setReturnTab] = useState<BottomTab | null>(null);
 
   // Detail screen state
   const [synopsisExpanded, setSynopsisExpanded] = useState(false);
@@ -82,6 +91,7 @@ function MainScreen() {
   const [pickerVisible, setPickerVisible] = useState(false);
   const [pickerLoading, setPickerLoading] = useState(false);
   const [pickerTitle, setPickerTitle] = useState<string | undefined>(undefined);
+  const [pickerThumb, setPickerThumb] = useState<string | undefined>(undefined);
   const [pickerVideos, setPickerVideos] = useState<MediaItem[]>([]);
   const [pickerReferer, setPickerReferer] = useState<string | undefined>(undefined);
 
@@ -94,36 +104,137 @@ function MainScreen() {
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [favorites, setFavorites] = useState<HistoryEntry[]>([]);
   const [watchedUrls, setWatchedUrls] = useState<string[]>([]);
+  const [continueWatching, setContinueWatching] = useState<
+    Array<WatchProgress & { url: string }>
+  >([]);
   const [customSources, setCustomSources] = useState<FixedSource[]>([]);
+
+  const refreshContinueWatching = async (): Promise<
+    Array<WatchProgress & { url: string }>
+  > => {
+    const all = await loadPlaybackProgress();
+    const list = Object.entries(all)
+      .map(([url, p]) => ({ url, ...p }))
+      .filter((p) => p.duration > 0 && p.position > 5 && p.position / p.duration < 0.9)
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .slice(0, 10);
+    setContinueWatching(list);
+    return list;
+  };
 
   useEffect(() => {
     void (async () => {
-      const [savedUrl, savedHistory, savedFavs, savedWatched, savedCustom] =
+      const [savedUrl, savedPin, savedHistory, savedFavs, savedWatched, savedCustom] =
         await Promise.all([
           loadBackendUrl(),
+          loadAccessPin(),
           loadHistory(),
           loadFavorites(),
           loadWatchedEpisodes(),
           loadCustomSources(),
         ]);
       setBackendUrl(savedUrl);
+      setAccessPin(savedPin);
       setHistory(savedHistory);
       setFavorites(savedFavs);
       setWatchedUrls(savedWatched);
       setCustomSources(savedCustom);
-      await loadUrl(FIXED_SOURCES[0].url, { backendOverride: savedUrl, silentHistory: true });
+      const cwList = await refreshContinueWatching();
+      await loadUrl(FIXED_SOURCES[0].url, {
+        backendOverride: savedUrl,
+        pinOverride: savedPin,
+        silentHistory: true,
+      });
+      void backfillMissingThumbnails(savedFavs, cwList, savedUrl, savedPin);
     })();
   }, []);
 
-  const handleSaveBackendUrl = async (newUrl: string) => {
+  const backfillMissingThumbnails = async (
+    favList: HistoryEntry[],
+    cwList: Array<WatchProgress & { url: string }>,
+    bUrl: string,
+    pinVal: string,
+  ) => {
+    const missingFavs = favList.filter((f) => !f.thumbnail).slice(0, 6);
+    if (missingFavs.length > 0) {
+      const updatedFavs = [...favList];
+      let changed = false;
+      await Promise.allSettled(
+        missingFavs.map(async (fav) => {
+          const data = await extractMediaFromUrl(bUrl, fav.url, { pin: pinVal });
+          const thumb = data.metadata.poster || data.images[0]?.url;
+          if (thumb) {
+            const idx = updatedFavs.findIndex((x) => x.url === fav.url);
+            if (idx >= 0) {
+              updatedFavs[idx] = { ...updatedFavs[idx], thumbnail: thumb };
+              changed = true;
+            }
+          }
+        }),
+      );
+      if (changed) {
+        setFavorites(updatedFavs);
+        await saveFavoritesList(updatedFavs);
+      }
+    }
+
+    const missingCw = cwList.filter((c) => !c.thumbnail).slice(0, 5);
+    if (missingCw.length > 0) {
+      await Promise.allSettled(
+        missingCw.map(async (cw) => {
+          const data = await extractMediaFromUrl(bUrl, cw.url, { pin: pinVal });
+          const thumb = data.metadata.poster || data.images[0]?.url;
+          const title = data.metadata.title;
+          if (thumb || title) {
+            await savePlaybackProgress(cw.url, cw.position, cw.duration, {
+              title: title || cw.title,
+              thumbnail: thumb || cw.thumbnail,
+            });
+          }
+        }),
+      );
+      const refreshed = await loadPlaybackProgress();
+      setContinueWatching(
+        Object.entries(refreshed)
+          .map(([url, p]) => ({ url, ...p }))
+          .filter((p) => p.duration > 0 && p.position > 5 && p.position / p.duration < 0.9)
+          .sort((a, b) => b.updatedAt - a.updatedAt)
+          .slice(0, 10),
+      );
+    }
+  };
+
+  // Keep reference clean for effect above
+  const backfillContinueWatching = async (
+    cwList: Array<WatchProgress & { url: string }>,
+    bUrl: string,
+    pinVal: string,
+  ) => {
+    const favs = await loadFavorites();
+    await backfillMissingThumbnails(favs, cwList, bUrl, pinVal);
+  };
+
+  const handleSaveBackendUrl = async (newUrl: string, newPin: string) => {
     setBackendUrl(newUrl);
-    await saveBackendUrl(newUrl);
-    void loadUrl(activeSource.url, { backendOverride: newUrl, silentHistory: true });
+    setAccessPin(newPin);
+    await Promise.all([saveBackendUrl(newUrl), saveAccessPin(newPin)]);
+    void loadUrl(activeSource.url, {
+      backendOverride: newUrl,
+      pinOverride: newPin,
+      silentHistory: true,
+    });
   };
 
   const loadUrl = async (
     targetUrl: string,
-    opts?: { pushHistory?: boolean; backendOverride?: string; silentHistory?: boolean },
+    opts?: {
+      pushHistory?: boolean;
+      preserveStack?: boolean;
+      backendOverride?: string;
+      pinOverride?: string;
+      silentHistory?: boolean;
+      refresh?: boolean;
+    },
   ) => {
     const clean = targetUrl.trim();
     if (!clean) return;
@@ -134,13 +245,16 @@ function MainScreen() {
     setSynopsisExpanded(false);
 
     try {
-      const data = await extractMediaFromUrl(opts?.backendOverride ?? backendUrl, clean);
+      const data = await extractMediaFromUrl(opts?.backendOverride ?? backendUrl, clean, {
+        refresh: opts?.refresh,
+        pin: opts?.pinOverride ?? accessPin,
+      });
       if (opts?.pushHistory && result) {
         setNavStack((prev) => [...prev, result]);
         if (Platform.OS === 'web' && typeof globalThis.window !== 'undefined') {
           globalThis.window.history.pushState({ youanimeStep: true }, '');
         }
-      } else if (!opts?.pushHistory) {
+      } else if (!opts?.pushHistory && !opts?.preserveStack) {
         setNavStack([]);
       }
       setResult(data);
@@ -155,6 +269,7 @@ function MainScreen() {
         const updated = await addHistoryEntry({
           url: data.metadata.sourceUrl,
           title: data.metadata.title,
+          thumbnail: data.metadata.poster || data.images[0]?.url,
           savedAt: Date.now(),
           counts: {
             videos: data.videos.length,
@@ -172,16 +287,23 @@ function MainScreen() {
     }
   };
 
-  const openServerPickerForUrl = async (episodeUrl: string, title?: string) => {
+  const openServerPickerForUrl = async (
+    episodeUrl: string,
+    title?: string,
+    thumbnail?: string,
+  ) => {
     setActionTarget(null);
     setPickerTitle(title);
+    setPickerThumb(thumbnail);
     setPickerVideos([]);
     setPickerReferer(episodeUrl);
     setPickerLoading(true);
     setPickerVisible(true);
 
     try {
-      const data = await extractMediaFromUrl(backendUrl, episodeUrl);
+      const data = await extractMediaFromUrl(backendUrl, episodeUrl, { pin: accessPin });
+      const resolvedThumb = thumbnail || data.metadata.poster || data.images[0]?.url;
+      if (resolvedThumb) setPickerThumb(resolvedThumb);
       if (data.videos.length === 0 && (data.pages?.length ?? 0) > 0) {
         setPickerVisible(false);
         if (result) setNavStack((prev) => [...prev, result]);
@@ -193,6 +315,7 @@ function MainScreen() {
       const updated = await addHistoryEntry({
         url: data.metadata.sourceUrl,
         title: data.metadata.title,
+        thumbnail: resolvedThumb,
         savedAt: Date.now(),
         counts: {
           videos: data.videos.length,
@@ -269,6 +392,15 @@ function MainScreen() {
       setSynopsisExpanded(false);
       return true;
     }
+    if (returnTab) {
+      setBottomTab(returnTab);
+      setReturnTab(null);
+      return true;
+    }
+    if (viewMode !== 'catalog') {
+      void loadUrl(activeSource.url, { silentHistory: true });
+      return true;
+    }
     return false;
   };
 
@@ -291,16 +423,39 @@ function MainScreen() {
     return () => globalThis.window.removeEventListener('popstate', onPopState);
   });
 
+  const handleGlobalSearch = async () => {
+    const q = searchInput.trim();
+    if (!q) return;
+    Keyboard.dismiss();
+    setLoading(true);
+    setError(null);
+    try {
+      const data = await globalSearchMedia(backendUrl, q, accessPin);
+      if (result) {
+        setNavStack((prev) => [...prev, result]);
+        if (Platform.OS === 'web' && typeof globalThis.window !== 'undefined') {
+          globalThis.window.history.pushState({ youanimeStep: true }, '');
+        }
+      }
+      setResult(data);
+      setBottomTab('home');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Error en búsqueda global');
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleSearchSubmit = () => {
     const q = searchInput.trim();
     if (!q) return;
     if (/^https?:\/\//i.test(q)) {
-      void loadUrl(q);
+      void loadUrl(q, { pushHistory: true });
     } else if (activeSource.searchUrlTemplate) {
       const searchUrl = activeSource.searchUrlTemplate.replace('{q}', encodeURIComponent(q));
       void loadUrl(searchUrl, { pushHistory: true });
     } else {
-      void loadUrl(`https://${q}`);
+      void loadUrl(`https://${q}`, { pushHistory: true });
     }
   };
 
@@ -319,6 +474,7 @@ function MainScreen() {
     const next = await toggleFavorite({
       url: result.metadata.sourceUrl,
       title: result.metadata.title,
+      thumbnail: result.metadata.poster || result.images[0]?.url,
       savedAt: Date.now(),
       counts: {
         videos: result.videos.length,
@@ -329,10 +485,22 @@ function MainScreen() {
     setFavorites(next);
   };
 
-  // Detect whether current result is a Catalog Grid, Anime Detail, or Generic Media page
-  const viewMode = useMemo<'catalog' | 'detail' | 'generic'>(() => {
+  // Detect whether current result is a Catalog Grid, Anime Detail, Manga Reader, or Generic Media page
+  const viewMode = useMemo<'catalog' | 'detail' | 'reader' | 'generic'>(() => {
     if (!result) return 'catalog';
     const pages = result.pages ?? [];
+    if (result.adapter === 'lectortmo') {
+      if (result.images.length > 0 && pages.length === 0) return 'reader';
+      const path = (() => {
+        try {
+          return new URL(result.metadata.sourceUrl).pathname;
+        } catch {
+          return '';
+        }
+      })();
+      if (/^\/manga\/[^/]+\/?$/.test(path)) return 'detail';
+      if (pages.length > 0) return 'catalog';
+    }
     if (result.adapter === 'animeflv') {
       const isDetailUrl =
         /\/anime\/[^/]+\/?$/.test(new URL(result.metadata.sourceUrl).pathname) ||
@@ -437,6 +605,56 @@ function MainScreen() {
     await saveCustomSources(next);
   };
 
+  const groupedCatalogSections = useMemo(() => {
+    const pages = result?.pages ?? [];
+    const hasGroups = pages.some((p) => Boolean(p.group));
+    if (!hasGroups) return null;
+    const groups: { title: string; items: PageLink[] }[] = [];
+    for (const p of pages) {
+      const label = p.group || 'Otros';
+      const existing = groups.find((g) => g.title === label);
+      if (existing) existing.items.push(p);
+      else groups.push({ title: label, items: [p] });
+    }
+    return groups;
+  }, [result]);
+
+  const renderPosterCard = (item: PageLink) => {
+    const thumbUri = item.thumbnail
+      ? buildProxyUrl(backendUrl, item.thumbnail, result?.metadata.sourceUrl, accessPin)
+      : undefined;
+    return (
+      <TouchableOpacity
+        key={item.id}
+        style={[styles.posterCard, { flex: 1 / gridColumns }]}
+        onPress={() => {
+          if (result?.adapter === 'lectortmo') {
+            void loadUrl(item.url, { pushHistory: true });
+          } else {
+            setActionTarget(item);
+          }
+        }}
+        activeOpacity={0.85}
+      >
+        {thumbUri ? (
+          <Image source={{ uri: thumbUri }} style={styles.posterImg} resizeMode="cover" />
+        ) : (
+          <View style={[styles.posterImg, styles.posterPlaceholder]}>
+            <Ionicons name="film-outline" size={28} color="#52525b" />
+          </View>
+        )}
+        <Text style={styles.posterTitle} numberOfLines={2}>
+          {item.title}
+        </Text>
+        {item.subtitle ? (
+          <Text style={styles.posterSub} numberOfLines={1}>
+            {item.subtitle}
+          </Text>
+        ) : null}
+      </TouchableOpacity>
+    );
+  };
+
   const renderCatalogView = () => {
     const pages = result?.pages ?? [];
     return (
@@ -497,7 +715,9 @@ function MainScreen() {
             </TouchableOpacity>
             <TouchableOpacity
               style={styles.headerIconBtn}
-              onPress={() => void loadUrl(activeSource.url, { silentHistory: true })}
+              onPress={() =>
+                void loadUrl(activeSource.url, { silentHistory: true, refresh: true })
+              }
             >
               <Ionicons name="refresh" size={21} color="#e2e8f0" />
             </TouchableOpacity>
@@ -551,6 +771,63 @@ function MainScreen() {
             <TouchableOpacity style={styles.searchGoBtn} onPress={handleSearchSubmit}>
               <Ionicons name="arrow-forward" size={18} color="#ffffff" />
             </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.globalSearchBtn}
+              onPress={() => void handleGlobalSearch()}
+            >
+              <Ionicons name="globe-outline" size={15} color="#e0e7ff" />
+              <Text style={styles.globalSearchText}>Todas</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+
+        {continueWatching.length > 0 && navStack.length === 0 && (
+          <View style={[styles.cwSection, isWide && styles.wideContainer]}>
+            <Text style={styles.cwHeading}>Seguir viendo</Text>
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={styles.cwRow}
+            >
+              {continueWatching.map((cw) => {
+                const ratio = Math.min(1, Math.max(0.05, cw.position / cw.duration));
+                const thumbUri = cw.thumbnail
+                  ? buildProxyUrl(backendUrl, cw.thumbnail, cw.url, accessPin)
+                  : undefined;
+                return (
+                  <TouchableOpacity
+                    key={cw.url}
+                    style={styles.cwCard}
+                    onPress={() =>
+                      void openServerPickerForUrl(
+                        cw.url,
+                        cw.title || 'Continuar',
+                        cw.thumbnail,
+                      )
+                    }
+                    activeOpacity={0.85}
+                  >
+                    {thumbUri ? (
+                      <Image
+                        source={{ uri: thumbUri }}
+                        style={styles.cwImg}
+                        resizeMode="cover"
+                      />
+                    ) : (
+                      <View style={[styles.cwImg, styles.posterPlaceholder]}>
+                        <Ionicons name="play-circle" size={28} color="#818cf8" />
+                      </View>
+                    )}
+                    <View style={styles.cwBarTrack}>
+                      <View style={[styles.cwBarFill, { width: `${ratio * 100}%` }]} />
+                    </View>
+                    <Text style={styles.cwTitle} numberOfLines={1}>
+                      {cw.title || cw.url}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </ScrollView>
           </View>
         )}
 
@@ -569,6 +846,55 @@ function MainScreen() {
             <ActivityIndicator size="large" color="#818cf8" />
             <Text style={styles.mutedText}>Cargando {activeSource.name}...</Text>
           </View>
+        ) : groupedCatalogSections ? (
+          <ScrollView
+            style={styles.flex1}
+            contentContainerStyle={[
+              styles.gridContainer,
+              isWide && styles.wideContainer,
+            ]}
+          >
+            {groupedCatalogSections.map((sec) => {
+              const rows: PageLink[][] = [];
+              for (let i = 0; i < sec.items.length; i += gridColumns) {
+                rows.push(sec.items.slice(i, i + gridColumns));
+              }
+              return (
+                <View key={sec.title} style={styles.dayGroupSection}>
+                  <View style={styles.dayGroupHeader}>
+                    <Ionicons name="calendar-outline" size={16} color="#818cf8" />
+                    <Text style={styles.dayGroupTitle}>{sec.title}</Text>
+                    <Text style={styles.dayGroupCount}>({sec.items.length})</Text>
+                  </View>
+                  {rows.map((row, rIdx) => (
+                    <View key={`${sec.title}-${rIdx}`} style={styles.dayGridRow}>
+                      {row.map((item) => renderPosterCard(item))}
+                      {row.length < gridColumns &&
+                        Array.from({ length: gridColumns - row.length }).map((_, padIdx) => (
+                          <View
+                            key={`pad-${padIdx}`}
+                            style={[styles.posterCard, { flex: 1 / gridColumns }]}
+                          />
+                        ))}
+                    </View>
+                  ))}
+                </View>
+              );
+            })}
+            {result?.nextPageUrl && (
+              <TouchableOpacity
+                style={styles.loadMoreBtn}
+                onPress={() => void handleLoadMore()}
+                disabled={loadingMore}
+              >
+                {loadingMore ? (
+                  <ActivityIndicator size="small" color="#e0e7ff" />
+                ) : (
+                  <Text style={styles.loadMoreText}>Cargar más</Text>
+                )}
+              </TouchableOpacity>
+            )}
+          </ScrollView>
         ) : (
           <FlatList
             key={`grid-${gridColumns}`}
@@ -593,7 +919,13 @@ function MainScreen() {
               return (
                 <TouchableOpacity
                   style={[styles.posterCard, { flex: 1 / gridColumns }]}
-                  onPress={() => setActionTarget(item)}
+                  onPress={() => {
+                    if (result?.adapter === 'lectortmo') {
+                      void loadUrl(item.url, { pushHistory: true });
+                    } else {
+                      setActionTarget(item);
+                    }
+                  }}
                   activeOpacity={0.85}
                 >
                   {thumbUri ? (
@@ -680,7 +1012,7 @@ function MainScreen() {
           <View style={styles.heroOverlay} />
 
           <View style={styles.heroTopActions}>
-            <TouchableOpacity onPress={handleGoBack} style={styles.circleIconBtn}>
+            <TouchableOpacity onPress={() => handleGoBack()} style={styles.circleIconBtn}>
               <Ionicons name="arrow-back" size={22} color="#f8fafc" />
             </TouchableOpacity>
             <TouchableOpacity
@@ -794,7 +1126,18 @@ function MainScreen() {
                     isWide && styles.episodePillWide,
                     watched && styles.episodePillWatched,
                   ]}
-                  onPress={() => void openServerPickerForUrl(ep.url, ep.title)}
+                  onPress={() => {
+                    if (result.adapter === 'lectortmo') {
+                      void markEpisodeWatched(ep.url).then(setWatchedUrls);
+                      void loadUrl(ep.url, { pushHistory: true });
+                    } else {
+                      void openServerPickerForUrl(
+                        ep.url,
+                        ep.title,
+                        ep.thumbnail || result.metadata.poster,
+                      );
+                    }
+                  }}
                   activeOpacity={0.75}
                 >
                   <Ionicons
@@ -1002,7 +1345,7 @@ function MainScreen() {
     const list = mode === 'favorites' ? favorites : history;
     return (
       <View style={styles.flex1}>
-        <View style={styles.tabPageHeader}>
+        <View style={[styles.tabPageHeader, isWide && styles.wideContainer]}>
           <Text style={styles.tabPageTitle}>
             {mode === 'favorites' ? 'Favoritos' : 'Historial'}
           </Text>
@@ -1019,30 +1362,49 @@ function MainScreen() {
         </View>
 
         <FlatList
+          key={`saved-${mode}-${gridColumns}`}
           data={list}
           keyExtractor={(item) => item.url}
-          contentContainerStyle={styles.genericList}
-          renderItem={({ item }) => (
-            <TouchableOpacity
-              style={styles.genericCard}
-              onPress={() => void loadUrl(item.url)}
-            >
-              <Ionicons
-                name={mode === 'favorites' ? 'heart' : 'time-outline'}
-                size={22}
-                color={mode === 'favorites' ? '#f43f5e' : '#818cf8'}
-              />
-              <View style={styles.flex1}>
-                <Text style={styles.posterTitle} numberOfLines={1}>
+          numColumns={gridColumns}
+          columnWrapperStyle={styles.gridRow}
+          contentContainerStyle={[styles.gridContainer, isWide && styles.wideContainer]}
+          renderItem={({ item }) => {
+            const thumbUri = item.thumbnail
+              ? buildProxyUrl(backendUrl, item.thumbnail, item.url, accessPin)
+              : undefined;
+            return (
+              <TouchableOpacity
+                style={[styles.posterCard, { flex: 1 / gridColumns }]}
+                onPress={() => {
+                  setReturnTab(mode);
+                  if (Platform.OS === 'web' && typeof globalThis.window !== 'undefined') {
+                    globalThis.window.history.pushState({ youanimeStep: true }, '');
+                  }
+                  void loadUrl(item.url);
+                }}
+                activeOpacity={0.85}
+              >
+                {thumbUri ? (
+                  <Image
+                    source={{ uri: thumbUri }}
+                    style={styles.posterImg}
+                    resizeMode="cover"
+                  />
+                ) : (
+                  <View style={[styles.posterImg, styles.posterPlaceholder]}>
+                    <Ionicons
+                      name={mode === 'favorites' ? 'heart' : 'time-outline'}
+                      size={30}
+                      color={mode === 'favorites' ? '#f43f5e' : '#818cf8'}
+                    />
+                  </View>
+                )}
+                <Text style={styles.posterTitle} numberOfLines={2}>
                   {item.title}
                 </Text>
-                <Text style={styles.posterSub} numberOfLines={1}>
-                  {item.url}
-                </Text>
-              </View>
-              <Ionicons name="chevron-forward" size={18} color="#71717a" />
-            </TouchableOpacity>
-          )}
+              </TouchableOpacity>
+            );
+          }}
           ListEmptyComponent={
             <View style={styles.centerBox}>
               <Ionicons
@@ -1062,17 +1424,53 @@ function MainScreen() {
     );
   };
 
+  const renderReaderView = () => {
+    if (!result) return null;
+    const parentManga = navStack.length > 0 ? navStack[navStack.length - 1] : null;
+    const chapters = parentManga?.pages ?? [];
+    const curIdx = chapters.findIndex((c) => c.url === result.metadata.sourceUrl);
+    const hasPrev = curIdx > 0;
+    const hasNext = curIdx >= 0 && curIdx + 1 < chapters.length;
+
+    return (
+      <MangaReaderView
+        title={result.metadata.title}
+        images={result.images}
+        backendUrl={backendUrl}
+        accessPin={accessPin}
+        referer={result.metadata.sourceUrl}
+        hasPrev={hasPrev}
+        hasNext={hasNext}
+        onPrev={() => {
+          if (!hasPrev) return;
+          const prevChap = chapters[curIdx - 1];
+          void markEpisodeWatched(prevChap.url).then(setWatchedUrls);
+          void loadUrl(prevChap.url, { preserveStack: true });
+        }}
+        onNext={() => {
+          if (!hasNext) return;
+          const nextChap = chapters[curIdx + 1];
+          void markEpisodeWatched(nextChap.url).then(setWatchedUrls);
+          void loadUrl(nextChap.url, { preserveStack: true });
+        }}
+        onBack={() => handleGoBack()}
+      />
+    );
+  };
+
   return (
     <SafeAreaView style={styles.container} edges={['top', 'left', 'right']}>
       <StatusBar style="light" />
 
       <View style={styles.flex1}>
         {bottomTab === 'home' &&
-          (viewMode === 'detail'
-            ? renderDetailView()
-            : viewMode === 'generic'
-              ? renderGenericView()
-              : renderCatalogView())}
+          (viewMode === 'reader'
+            ? renderReaderView()
+            : viewMode === 'detail'
+              ? renderDetailView()
+              : viewMode === 'generic'
+                ? renderGenericView()
+                : renderCatalogView())}
         {bottomTab === 'servers' && renderServersTab()}
         {bottomTab === 'favorites' && renderSavedListTab('favorites')}
         {bottomTab === 'history' && renderSavedListTab('history')}
@@ -1130,7 +1528,11 @@ function MainScreen() {
               style={styles.actionRow}
               onPress={() => {
                 if (actionTarget) {
-                  void openServerPickerForUrl(actionTarget.url, actionTarget.title);
+                  void openServerPickerForUrl(
+                    actionTarget.url,
+                    actionTarget.title,
+                    actionTarget.thumbnail,
+                  );
                 }
               }}
             >
@@ -1170,7 +1572,10 @@ function MainScreen() {
       <MediaViewerModal
         item={selectedItem}
         backendUrl={backendUrl}
+        accessPin={accessPin}
         referer={viewerReferer}
+        episodeTitle={pickerTitle || result?.metadata.title}
+        episodeThumbnail={pickerThumb || result?.metadata.poster || result?.images[0]?.url}
         serverOptions={pickerVideos}
         onSelectServer={(srv) => setSelectedItem(srv)}
         hasPrevEpisode={
@@ -1182,14 +1587,18 @@ function MainScreen() {
         onWatched={(epUrl) => {
           void markEpisodeWatched(epUrl).then(setWatchedUrls);
         }}
-        onClose={() => setSelectedItem(null)}
+        onClose={() => {
+          setSelectedItem(null);
+          void refreshContinueWatching();
+        }}
       />
 
       {/* Backend IP Settings */}
       <SettingsModal
         visible={settingsVisible}
         currentUrl={backendUrl}
-        onSave={(newUrl) => void handleSaveBackendUrl(newUrl)}
+        currentPin={accessPin}
+        onSave={(newUrl, newPin) => void handleSaveBackendUrl(newUrl, newPin)}
         onClose={() => setSettingsVisible(false)}
       />
     </SafeAreaView>
@@ -1334,6 +1743,87 @@ const styles = StyleSheet.create({
     backgroundColor: '#6366f1',
     padding: 11,
     borderRadius: 12,
+  },
+  globalSearchBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    backgroundColor: '#232634',
+    paddingHorizontal: 11,
+    paddingVertical: 11,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#363b54',
+  },
+  globalSearchText: {
+    color: '#e0e7ff',
+    fontSize: 12.5,
+    fontWeight: '600',
+  },
+  cwSection: {
+    marginBottom: 10,
+  },
+  cwHeading: {
+    color: '#e2e8f0',
+    fontSize: 14,
+    fontWeight: '700',
+    paddingHorizontal: 14,
+    marginBottom: 8,
+  },
+  cwRow: {
+    paddingHorizontal: 14,
+    gap: 10,
+  },
+  cwCard: {
+    width: 132,
+  },
+  cwImg: {
+    width: 132,
+    height: 78,
+    borderRadius: 8,
+    backgroundColor: '#1e212d',
+  },
+  cwBarTrack: {
+    height: 3,
+    backgroundColor: '#2d3142',
+    borderRadius: 2,
+    marginTop: 4,
+    overflow: 'hidden',
+  },
+  cwBarFill: {
+    height: '100%',
+    backgroundColor: '#818cf8',
+  },
+  cwTitle: {
+    color: '#cbd5e1',
+    fontSize: 11.5,
+    fontWeight: '600',
+    marginTop: 4,
+  },
+  dayGroupSection: {
+    marginBottom: 14,
+  },
+  dayGroupHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 7,
+    marginBottom: 10,
+    paddingHorizontal: 4,
+  },
+  dayGroupTitle: {
+    color: '#f1f5f9',
+    fontSize: 15,
+    fontWeight: '700',
+  },
+  dayGroupCount: {
+    color: '#94a3b8',
+    fontSize: 12.5,
+    fontWeight: '600',
+  },
+  dayGridRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 8,
   },
   gridContainer: {
     paddingHorizontal: 10,
