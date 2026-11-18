@@ -1,0 +1,17 @@
+{
+  "name": "cinestream",
+  "version": "1.0.0",
+  "private": true,
+  "packageManager": "pnpm@12.4.2",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "pnpm --filter youanime-backend run build && EXPO_NO_TELEMETRY=1 pnpm --filter youanime-mobile exec expo export --platform web --output-dir ../backend/public",
+    "start": "pnpm --filter youanime-backend start",
+    "dev:backend": "pnpm --filter youanime-backend dev",
+    "dev:mobile": "pnpm --filter youanime-mobile start",
+    "dev:web": "pnpm --filter youanime-mobile web",
+    "test": "pnpm --filter youanime-backend test"
+  }
+}
