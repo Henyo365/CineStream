@@ -23,12 +23,13 @@ import {
   Platform,
   Pressable,
   ScrollView,
+  StatusBar as RNStatusBar,
   StyleSheet,
   Text,
   TouchableOpacity,
   View,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { WebView } from 'react-native-webview';
 import { buildProxyUrl, resolveVideoUrl, type SubtitleOption } from '../services/api';
 import { loadPlaybackProgress, savePlaybackProgress } from '../services/storage';
@@ -684,6 +685,22 @@ function CustomNativePlayer({
     nativeSubs.length > 0 ||
     Boolean(externalSubtitles && externalSubtitles.length > 0);
 
+  const insets = useSafeAreaInsets();
+  const androidStatusBar = Platform.OS === 'android' ? (RNStatusBar.currentHeight ?? 32) : 0;
+  const safeTop = isFullscreen
+    ? Math.max(insets.top, 12) + 8
+    : Math.max(insets.top, androidStatusBar, 32) + 12;
+  const safeBottom = isFullscreen
+    ? Math.max(insets.bottom, 16) + 12
+    : Math.max(insets.bottom, Platform.OS === 'android' ? 54 : 24) + 16;
+  const safeLeft = Math.max(insets.left, 16) + 4;
+  const safeRight = Math.max(insets.right, 16) + 4;
+
+  const audioButtonLabel =
+    selectedAudio?.label && !/^(und|unknown)$/i.test(selectedAudio.label.trim())
+      ? selectedAudio.label
+      : 'Idioma';
+
   return (
     <View
       style={styles.videoWrapper}
@@ -724,7 +741,7 @@ function CustomNativePlayer({
 
       {/* External VTT subtitle overlay */}
       {activeCueText ? (
-        <View style={styles.subtitleBox} pointerEvents="none">
+        <View style={[styles.subtitleBox, { bottom: safeBottom + 64 }]} pointerEvents="none">
           <Text style={styles.subtitleText}>{activeCueText}</Text>
         </View>
       ) : null}
@@ -737,13 +754,16 @@ function CustomNativePlayer({
         </View>
       )}
       {status === 'loading' && hasLoadedOnce && (
-        <View style={styles.rebufferBadge} pointerEvents="none">
+        <View
+          style={[styles.rebufferBadge, { top: safeTop + 44, right: safeRight }]}
+          pointerEvents="none"
+        >
           <ActivityIndicator size="small" color="#ffffff" />
         </View>
       )}
 
       {nextCountdown !== null && (
-        <View style={styles.nextUpBanner}>
+        <View style={[styles.nextUpBanner, { bottom: safeBottom + 76, right: safeRight }]}>
           <Text style={styles.nextUpText}>
             Siguiente episodio en {nextCountdown}s...
           </Text>
@@ -768,7 +788,10 @@ function CustomNativePlayer({
       )}
 
       {controlsVisible && isLocked && status !== 'error' && (
-        <View style={styles.lockedOverlay} pointerEvents="box-none">
+        <View
+          style={[styles.lockedOverlay, { paddingTop: safeTop, paddingRight: safeRight }]}
+          pointerEvents="box-none"
+        >
           <TouchableOpacity
             style={styles.unlockBtn}
             onPress={() => {
@@ -783,7 +806,18 @@ function CustomNativePlayer({
       )}
 
       {controlsVisible && !isLocked && status !== 'error' && (
-        <View style={styles.playerOverlay} pointerEvents="box-none">
+        <View
+          style={[
+            styles.playerOverlay,
+            {
+              paddingTop: safeTop,
+              paddingBottom: safeBottom,
+              paddingLeft: safeLeft,
+              paddingRight: safeRight,
+            },
+          ]}
+          pointerEvents="box-none"
+        >
           {/* Top bar */}
           <View style={styles.playerTopBar}>
             <TouchableOpacity onPress={onClose} style={styles.playerIconBtn}>
@@ -809,9 +843,7 @@ function CustomNativePlayer({
               style={styles.playerPillBtn}
             >
               <Ionicons name="headset-outline" size={14} color="#e0e7ff" />
-              <Text style={styles.playerPillText}>
-                {selectedAudio?.label || 'Idioma'}
-              </Text>
+              <Text style={styles.playerPillText}>{audioButtonLabel}</Text>
             </TouchableOpacity>
             <TouchableOpacity
               onPress={() => {
@@ -1737,7 +1769,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   playerBottomBar: {
-    gap: 10,
+    gap: 14,
   },
   timeRow: {
     flexDirection: 'row',
@@ -1817,8 +1849,10 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
+    gap: 10,
   },
   epNavRow: {
+    flex: 1,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
