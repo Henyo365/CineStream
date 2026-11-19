@@ -1,5 +1,5 @@
 import { Ionicons } from '@expo/vector-icons';
-import React from 'react';
+import React, { useMemo } from 'react';
 import {
   ActivityIndicator,
   Modal,
@@ -17,6 +17,7 @@ interface ServerPickerModalProps {
   loading: boolean;
   videos: MediaItem[];
   onSelect: (item: MediaItem) => void;
+  onRetry?: () => void;
   onClose: () => void;
 }
 
@@ -26,49 +27,89 @@ export function ServerPickerModal({
   loading,
   videos,
   onSelect,
+  onRetry,
   onClose,
 }: ServerPickerModalProps) {
+  const orderedVideos = useMemo(() => {
+    return [...videos].sort((a, b) => {
+      const aDirect = !a.isEmbed ? 1 : 0;
+      const bDirect = !b.isEmbed ? 1 : 0;
+      return bDirect - aDirect;
+    });
+  }, [videos]);
+
   return (
     <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
       <TouchableOpacity style={styles.backdrop} activeOpacity={1} onPress={onClose}>
         <TouchableOpacity style={styles.dialog} activeOpacity={1} onPress={() => {}}>
           <View style={styles.header}>
-            <Ionicons name="chevron-back" size={18} color="#94a3b8" />
-            <Text style={styles.headerTitle} numberOfLines={1}>
-              {title ? `Reprod. Interno • ${title}` : 'Reprod. Interno'}
-            </Text>
-            <Ionicons name="chevron-forward" size={18} color="#94a3b8" />
+            <View style={styles.headerIcon}>
+              <Ionicons name="play-circle" size={20} color="#818cf8" />
+            </View>
+            <View style={styles.headerTitleCol}>
+              <Text style={styles.headerTitle} numberOfLines={1}>
+                {title || 'Elegir servidor'}
+              </Text>
+              {!loading && videos.length > 0 && (
+                <Text style={styles.headerSub}>
+                  {videos.length} {videos.length === 1 ? 'servidor disponible' : 'servidores disponibles'}
+                </Text>
+              )}
+            </View>
+            <TouchableOpacity onPress={onClose} style={styles.closeBtn}>
+              <Ionicons name="close" size={20} color="#94a3b8" />
+            </TouchableOpacity>
           </View>
 
           {loading ? (
             <View style={styles.loadingBox}>
               <ActivityIndicator size="large" color="#818cf8" />
-              <Text style={styles.loadingText}>Cargando servidores...</Text>
+              <Text style={styles.loadingText}>Buscando servidores...</Text>
             </View>
-          ) : videos.length === 0 ? (
+          ) : orderedVideos.length === 0 ? (
             <View style={styles.loadingBox}>
-              <Ionicons name="videocam-off-outline" size={32} color="#71717a" />
+              <Ionicons name="videocam-off-outline" size={34} color="#71717a" />
               <Text style={styles.loadingText}>No se encontraron reproductores.</Text>
+              {onRetry && (
+                <TouchableOpacity style={styles.retryBtn} onPress={onRetry}>
+                  <Ionicons name="refresh" size={16} color="#e0e7ff" />
+                  <Text style={styles.retryText}>Reintentar</Text>
+                </TouchableOpacity>
+              )}
             </View>
           ) : (
             <ScrollView style={styles.list} contentContainerStyle={styles.listContent}>
-              {videos.map((video, idx) => (
-                <TouchableOpacity
-                  key={video.id}
-                  style={styles.serverRow}
-                  onPress={() => onSelect(video)}
-                  activeOpacity={0.7}
-                >
-                  <Ionicons
-                    name={video.isEmbed ? 'play-outline' : 'play-circle-outline'}
-                    size={22}
-                    color="#e2e8f0"
-                  />
-                  <Text style={styles.serverName} numberOfLines={1}>
-                    {video.title || `Opción ${idx + 1}`}
-                  </Text>
-                </TouchableOpacity>
-              ))}
+              {orderedVideos.map((video, idx) => {
+                const isDirect = !video.isEmbed;
+                const cleanTitle = (video.title || `Opción ${idx + 1}`).replace(/\s*★\s*Nativo/i, '');
+                return (
+                  <TouchableOpacity
+                    key={video.id}
+                    style={[styles.serverRow, isDirect && styles.serverRowDirect]}
+                    onPress={() => onSelect(video)}
+                    activeOpacity={0.75}
+                  >
+                    <Ionicons
+                      name={isDirect ? 'flash' : 'play-outline'}
+                      size={20}
+                      color={isDirect ? '#4ade80' : '#cbd5e1'}
+                    />
+                    <Text style={styles.serverName} numberOfLines={1}>
+                      {cleanTitle}
+                    </Text>
+                    <View style={[styles.badge, isDirect ? styles.badgeDirect : styles.badgeEmbed]}>
+                      <Text
+                        style={[
+                          styles.badgeText,
+                          isDirect ? styles.badgeTextDirect : styles.badgeTextEmbed,
+                        ]}
+                      >
+                        {isDirect ? 'Nativo' : 'Auto'}
+                      </Text>
+                    </View>
+                  </TouchableOpacity>
+                );
+              })}
             </ScrollView>
           )}
 
@@ -86,37 +127,55 @@ export function ServerPickerModal({
 const styles = StyleSheet.create({
   backdrop: {
     flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.72)',
+    backgroundColor: 'rgba(0,0,0,0.75)',
     justifyContent: 'center',
     alignItems: 'center',
     padding: 24,
   },
   dialog: {
     width: '100%',
-    maxWidth: 360,
-    maxHeight: '75%',
-    backgroundColor: '#23262f',
-    borderRadius: 22,
-    paddingTop: 18,
-    paddingBottom: 14,
-    paddingHorizontal: 18,
+    maxWidth: 380,
+    maxHeight: '78%',
+    backgroundColor: '#1d202b',
+    borderRadius: 20,
+    paddingTop: 16,
+    paddingBottom: 12,
+    paddingHorizontal: 16,
     borderWidth: 1,
-    borderColor: '#323644',
+    borderColor: '#2f3447',
   },
   header: {
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'space-between',
-    marginBottom: 14,
-    paddingHorizontal: 4,
+    gap: 10,
+    marginBottom: 12,
+    paddingBottom: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: '#2a2e3e',
+  },
+  headerIcon: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: 'rgba(99, 102, 241, 0.16)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  headerTitleCol: {
+    flex: 1,
   },
   headerTitle: {
-    flex: 1,
-    textAlign: 'center',
-    color: '#e2e8f0',
+    color: '#f8fafc',
     fontSize: 15,
-    fontWeight: '600',
-    marginHorizontal: 8,
+    fontWeight: '700',
+  },
+  headerSub: {
+    color: '#94a3b8',
+    fontSize: 11.5,
+    marginTop: 1,
+  },
+  closeBtn: {
+    padding: 4,
   },
   loadingBox: {
     alignItems: 'center',
@@ -126,33 +185,75 @@ const styles = StyleSheet.create({
   },
   loadingText: {
     color: '#94a3b8',
+    fontSize: 13.5,
+  },
+  retryBtn: {
+    marginTop: 6,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: '#363b54',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 10,
+  },
+  retryText: {
+    color: '#e0e7ff',
     fontSize: 13,
+    fontWeight: '600',
   },
   list: {
-    maxHeight: 340,
+    maxHeight: 350,
   },
   listContent: {
-    gap: 4,
+    gap: 6,
   },
   serverRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 16,
-    paddingVertical: 13,
-    paddingHorizontal: 10,
+    gap: 12,
+    paddingVertical: 12,
+    paddingHorizontal: 12,
     borderRadius: 12,
+    backgroundColor: '#252836',
+  },
+  serverRowDirect: {
+    borderWidth: 1,
+    borderColor: 'rgba(74, 222, 128, 0.35)',
+    backgroundColor: 'rgba(74, 222, 128, 0.08)',
   },
   serverName: {
     flex: 1,
     color: '#f1f5f9',
-    fontSize: 15,
-    fontWeight: '500',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  badge: {
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 8,
+  },
+  badgeDirect: {
+    backgroundColor: 'rgba(34, 197, 94, 0.2)',
+  },
+  badgeEmbed: {
+    backgroundColor: 'rgba(148, 163, 184, 0.16)',
+  },
+  badgeText: {
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  badgeTextDirect: {
+    color: '#4ade80',
+  },
+  badgeTextEmbed: {
+    color: '#94a3b8',
   },
   footer: {
     flexDirection: 'row',
     justifyContent: 'flex-end',
     marginTop: 10,
-    paddingTop: 6,
+    paddingTop: 4,
   },
   cancelBtn: {
     paddingHorizontal: 12,

@@ -50,6 +50,7 @@ interface WebCustomVideoPlayerProps {
   uri: string;
   isHls: boolean;
   backendUrl: string;
+  accessPin?: string;
   referer?: string;
   episodeKey?: string;
   title: string;
@@ -69,6 +70,7 @@ export function WebCustomVideoPlayer({
   uri,
   isHls,
   backendUrl,
+  accessPin,
   referer,
   episodeKey,
   title,
@@ -92,6 +94,7 @@ export function WebCustomVideoPlayer({
   const [isBuffering, setIsBuffering] = useState(true);
   const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
+  const [bufferedTime, setBufferedTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [speedIdx, setSpeedIdx] = useState(0);
   const [contentFit, setContentFit] = useState<'contain' | 'cover'>('contain');
@@ -213,10 +216,31 @@ export function WebCustomVideoPlayer({
       void video.play().catch(() => {});
     }
 
+    const persistProgressNow = (pos?: number, dur?: number) => {
+      const ct = pos ?? (video.currentTime || 0);
+      const d = dur ?? (video.duration || 0);
+      if (episodeKey && d > 0 && ct > 2) {
+        void savePlaybackProgress(episodeKey, ct, d, {
+          title,
+          thumbnail: posterThumbnail,
+        });
+      }
+    };
+
     const onPlay = () => setIsPlaying(true);
-    const onPause = () => setIsPlaying(false);
+    const onPause = () => {
+      setIsPlaying(false);
+      persistProgressNow();
+    };
     const onWaiting = () => setIsBuffering(true);
     const onEnded = () => {
+      if (episodeKey && video.duration > 0) {
+        persistProgressNow(video.duration, video.duration);
+        if (!watchedMarkedRef.current) {
+          watchedMarkedRef.current = true;
+          onWatched?.(episodeKey);
+        }
+      }
       if (hasNext) {
         setNextCountdown(5);
       }
@@ -244,6 +268,13 @@ export function WebCustomVideoPlayer({
       const dur = video.duration || 0;
       setCurrentTime(ct);
       setDuration(dur);
+      if (video.buffered && video.buffered.length > 0) {
+        try {
+          setBufferedTime(video.buffered.end(video.buffered.length - 1));
+        } catch {
+          // ignore
+        }
+      }
       setIsBuffering(false);
       setHasLoadedOnce(true);
       if (episodeKey && dur > 0) {
@@ -269,6 +300,7 @@ export function WebCustomVideoPlayer({
     video.addEventListener('timeupdate', onTimeUpdate);
 
     return () => {
+      persistProgressNow();
       video.removeEventListener('play', onPlay);
       video.removeEventListener('pause', onPause);
       video.removeEventListener('waiting', onWaiting);
@@ -294,38 +326,41 @@ export function WebCustomVideoPlayer({
     return () => clearTimeout(t);
   }, [nextCountdown, onNext]);
 
-  // Web keyboard shortcuts (Space, Arrows, F, M)
+  const keyHandlerRef = useRef<(ev: KeyboardEvent) => void>(() => {});
+  keyHandlerRef.current = (ev: KeyboardEvent) => {
+    const tag = (ev.target as HTMLElement | null)?.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+    if (ev.code === 'Space' || ev.key === 'k' || ev.key === 'K') {
+      ev.preventDefault();
+      handleTogglePlay();
+    } else if (ev.key === 'ArrowLeft') {
+      ev.preventDefault();
+      handleSeekBy(-10);
+    } else if (ev.key === 'ArrowRight') {
+      ev.preventDefault();
+      handleSeekBy(10);
+    } else if (ev.key === 'ArrowUp') {
+      ev.preventDefault();
+      handleStepVolume(0.1);
+    } else if (ev.key === 'ArrowDown') {
+      ev.preventDefault();
+      handleStepVolume(-0.1);
+    } else if (ev.key === 'm' || ev.key === 'M') {
+      ev.preventDefault();
+      handleToggleMute();
+    } else if (ev.key === 'f' || ev.key === 'F') {
+      ev.preventDefault();
+      void handleToggleFullscreen();
+    }
+  };
+
+  // Web keyboard shortcuts (Space, Arrows, F, M) — attached once!
   useEffect(() => {
     if (typeof globalThis.window === 'undefined') return;
-    const onKeyDown = (ev: KeyboardEvent) => {
-      const tag = (ev.target as HTMLElement | null)?.tagName;
-      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
-      if (ev.code === 'Space' || ev.key === 'k' || ev.key === 'K') {
-        ev.preventDefault();
-        handleTogglePlay();
-      } else if (ev.key === 'ArrowLeft') {
-        ev.preventDefault();
-        handleSeekBy(-10);
-      } else if (ev.key === 'ArrowRight') {
-        ev.preventDefault();
-        handleSeekBy(10);
-      } else if (ev.key === 'ArrowUp') {
-        ev.preventDefault();
-        handleStepVolume(0.1);
-      } else if (ev.key === 'ArrowDown') {
-        ev.preventDefault();
-        handleStepVolume(-0.1);
-      } else if (ev.key === 'm' || ev.key === 'M') {
-        ev.preventDefault();
-        handleToggleMute();
-      } else if (ev.key === 'f' || ev.key === 'F') {
-        ev.preventDefault();
-        void handleToggleFullscreen();
-      }
-    };
-    globalThis.window.addEventListener('keydown', onKeyDown);
-    return () => globalThis.window.removeEventListener('keydown', onKeyDown);
-  });
+    const listener = (ev: KeyboardEvent) => keyHandlerRef.current(ev);
+    globalThis.window.addEventListener('keydown', listener);
+    return () => globalThis.window.removeEventListener('keydown', listener);
+  }, []);
 
   useEffect(() => {
     if (!selectedExtSubUrl) {
@@ -333,7 +368,7 @@ export function WebCustomVideoPlayer({
       return;
     }
     let cancelled = false;
-    const proxiedSub = buildProxyUrl(backendUrl, selectedExtSubUrl, referer);
+    const proxiedSub = buildProxyUrl(backendUrl, selectedExtSubUrl, referer, accessPin);
     void fetch(proxiedSub)
       .then((r) => r.text())
       .then((txt) => {
@@ -345,7 +380,7 @@ export function WebCustomVideoPlayer({
     return () => {
       cancelled = true;
     };
-  }, [selectedExtSubUrl, backendUrl, referer]);
+  }, [selectedExtSubUrl, backendUrl, referer, accessPin]);
 
   const activeCueText = useMemo(() => {
     if (extCues.length === 0) return '';
@@ -354,6 +389,7 @@ export function WebCustomVideoPlayer({
   }, [extCues, currentTime]);
 
   const progressRatio = duration > 0 ? Math.min(1, Math.max(0, currentTime / duration)) : 0;
+  const bufferedRatio = duration > 0 ? Math.min(1, Math.max(progressRatio, bufferedTime / duration)) : 0;
 
   const handleTogglePlay = () => {
     const v = videoElRef.current;
@@ -582,6 +618,7 @@ export function WebCustomVideoPlayer({
                   onLayout={handleBarLayout}
                   onPress={handleSeekBarPress}
                 >
+                  <View style={[styles.seekBuffered, { width: `${bufferedRatio * 100}%` }]} />
                   <View style={[styles.seekFill, { width: `${progressRatio * 100}%` }]} />
                 </Pressable>
                 <Text style={styles.timeText}>{formatTime(duration)}</Text>
@@ -589,6 +626,13 @@ export function WebCustomVideoPlayer({
 
               <View style={styles.bottomActionsRow}>
                 <View style={styles.epNavRow}>
+                  <TouchableOpacity
+                    onPress={() => handleSeekBy(85)}
+                    style={styles.playerPillBtn}
+                  >
+                    <Ionicons name="play-forward-outline" size={14} color="#e0e7ff" />
+                    <Text style={styles.playerPillText}>+85s Intro</Text>
+                  </TouchableOpacity>
                   {hasPrev && (
                     <TouchableOpacity onPress={onPrev} style={styles.playerPillBtn}>
                       <Ionicons name="play-skip-back" size={14} color="#e0e7ff" />
@@ -1010,16 +1054,25 @@ const styles = StyleSheet.create({
   },
   seekTrack: {
     flex: 1,
-    height: 18,
+    height: 12,
     justifyContent: 'center',
-    backgroundColor: 'rgba(255,255,255,0.22)',
-    borderRadius: 9,
+    backgroundColor: 'rgba(255,255,255,0.2)',
+    borderRadius: 6,
     overflow: 'hidden',
+    position: 'relative',
+  },
+  seekBuffered: {
+    position: 'absolute',
+    left: 0,
+    top: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(255,255,255,0.32)',
+    borderRadius: 6,
   },
   seekFill: {
     height: '100%',
     backgroundColor: '#818cf8',
-    borderRadius: 9,
+    borderRadius: 6,
   },
   bottomActionsRow: {
     flexDirection: 'row',

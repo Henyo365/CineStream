@@ -68,6 +68,13 @@ export async function clearHistory(): Promise<void> {
   await AsyncStorage.removeItem(HISTORY_KEY);
 }
 
+export async function removeHistoryEntry(url: string): Promise<HistoryEntry[]> {
+  const current = await loadHistory();
+  const next = current.filter((item) => item.url !== url);
+  await AsyncStorage.setItem(HISTORY_KEY, JSON.stringify(next));
+  return next;
+}
+
 export async function loadFavorites(): Promise<HistoryEntry[]> {
   const raw = await AsyncStorage.getItem(FAVORITES_KEY);
   if (!raw) return [];
@@ -105,7 +112,16 @@ export async function loadWatchedEpisodes(): Promise<string[]> {
 export async function markEpisodeWatched(url: string): Promise<string[]> {
   const current = await loadWatchedEpisodes();
   if (current.includes(url)) return current;
-  const next = [url, ...current].slice(0, 300);
+  const next = [url, ...current].slice(0, 500);
+  await AsyncStorage.setItem(WATCHED_KEY, JSON.stringify(next));
+  return next;
+}
+
+export async function toggleEpisodeWatched(url: string): Promise<string[]> {
+  const current = await loadWatchedEpisodes();
+  const next = current.includes(url)
+    ? current.filter((u) => u !== url)
+    : [url, ...current].slice(0, 500);
   await AsyncStorage.setItem(WATCHED_KEY, JSON.stringify(next));
   return next;
 }
@@ -136,6 +152,21 @@ export async function savePlaybackProgress(
     title: meta?.title ?? prev?.title,
     thumbnail: meta?.thumbnail ?? prev?.thumbnail,
   };
+  // Keep only the 100 most recently updated items
+  const entries = Object.entries(current);
+  if (entries.length > 100) {
+    entries.sort((a, b) => b[1].updatedAt - a[1].updatedAt);
+    const trimmed = Object.fromEntries(entries.slice(0, 100));
+    await AsyncStorage.setItem(PROGRESS_KEY, JSON.stringify(trimmed));
+    return;
+  }
+  await AsyncStorage.setItem(PROGRESS_KEY, JSON.stringify(current));
+}
+
+export async function removePlaybackProgress(url: string): Promise<void> {
+  const current = await loadPlaybackProgress();
+  if (!(url in current)) return;
+  delete current[url];
   await AsyncStorage.setItem(PROGRESS_KEY, JSON.stringify(current));
 }
 

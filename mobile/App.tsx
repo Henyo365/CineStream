@@ -1,7 +1,7 @@
 import { Ionicons } from '@expo/vector-icons';
 import * as Clipboard from 'expo-clipboard';
 import { StatusBar } from 'expo-status-bar';
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -11,6 +11,7 @@ import {
   Keyboard,
   Modal,
   Platform,
+  RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
@@ -37,11 +38,14 @@ import {
   loadPlaybackProgress,
   loadWatchedEpisodes,
   markEpisodeWatched,
+  removeHistoryEntry,
+  removePlaybackProgress,
   saveAccessPin,
   saveBackendUrl,
   saveCustomSources,
   saveFavoritesList,
   savePlaybackProgress,
+  toggleEpisodeWatched,
   toggleFavorite,
   type WatchProgress,
 } from './src/services/storage';
@@ -50,12 +54,51 @@ import type {
   ExtractionResult,
   HistoryEntry,
   MediaItem,
-  MediaType,
   PageLink,
 } from './src/types';
 
 type BottomTab = 'home' | 'servers' | 'favorites' | 'history';
 type MediaFilterTab = 'videos' | 'images' | 'pdfs' | 'pages';
+
+function extractNumericOrder(page: PageLink): number | null {
+  const source = `${page.title} ${page.subtitle ?? ''} ${page.url}`;
+  const seasonEp = source.match(/(\d+)\s*[xX]\s*(\d+)/);
+  if (seasonEp) {
+    return parseInt(seasonEp[1], 10) * 10000 + parseInt(seasonEp[2], 10);
+  }
+  const cap = source.match(/(?:cap[ií]tulo|episodio|ep\.?)\s*(\d+(?:\.\d+)?)/i);
+  if (cap) return parseFloat(cap[1]);
+  const trailing = page.url.match(/(\d+(?:-\d+)?)\/?$/);
+  if (trailing) return parseFloat(trailing[1].replace('-', '.'));
+  return null;
+}
+
+function detectPagesDescending(pages: PageLink[]): boolean {
+  if (pages.length < 2) return true;
+  const first = extractNumericOrder(pages[0]);
+  const last = extractNumericOrder(pages[pages.length - 1]);
+  if (first !== null && last !== null && first !== last) {
+    return first > last;
+  }
+  return true;
+}
+
+function isMangaLink(url: string, adapter?: string): boolean {
+  if (adapter === 'lectortmo') return true;
+  const lower = url.toLowerCase();
+  return lower.includes('lectortmo.') || /\/manga(?:-chapter)?\//.test(lower);
+}
+
+function formatRemainingTime(position: number, duration: number): string {
+  const rem = Math.max(0, Math.round((duration - position) / 60));
+  if (rem <= 1) return '<1m rest.';
+  if (rem >= 60) {
+    const h = Math.floor(rem / 60);
+    const m = rem % 60;
+    return `${h}h ${m}m rest.`;
+  }
+  return `${rem}m rest.`;
+}
 
 function MainScreen() {
   const { width: windowWidth } = useWindowDimensions();
@@ -103,11 +146,17 @@ function MainScreen() {
   const [settingsVisible, setSettingsVisible] = useState(false);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [favorites, setFavorites] = useState<HistoryEntry[]>([]);
+  const [savedSearchQuery, setSavedSearchQuery] = useState('');
   const [watchedUrls, setWatchedUrls] = useState<string[]>([]);
   const [continueWatching, setContinueWatching] = useState<
     Array<WatchProgress & { url: string }>
   >([]);
   const [customSources, setCustomSources] = useState<FixedSource[]>([]);
+
+  const requestIdRef = useRef(0);
+  const lastPickerRequestRef = useRef<{ url: string; title?: string; thumbnail?: string } | null>(
+    null,
+  );
 
   const refreshContinueWatching = async (): Promise<
     Array<WatchProgress & { url: string }>
@@ -204,16 +253,6 @@ function MainScreen() {
     }
   };
 
-  // Keep reference clean for effect above
-  const backfillContinueWatching = async (
-    cwList: Array<WatchProgress & { url: string }>,
-    bUrl: string,
-    pinVal: string,
-  ) => {
-    const favs = await loadFavorites();
-    await backfillMissingThumbnails(favs, cwList, bUrl, pinVal);
-  };
-
   const handleSaveBackendUrl = async (newUrl: string, newPin: string) => {
     setBackendUrl(newUrl);
     setAccessPin(newPin);
@@ -239,16 +278,20 @@ function MainScreen() {
     const clean = targetUrl.trim();
     if (!clean) return;
 
+    const reqId = ++requestIdRef.current;
     Keyboard.dismiss();
     setLoading(true);
     setError(null);
     setSynopsisExpanded(false);
+    setEpisodeFilter('');
 
     try {
       const data = await extractMediaFromUrl(opts?.backendOverride ?? backendUrl, clean, {
         refresh: opts?.refresh,
         pin: opts?.pinOverride ?? accessPin,
       });
+      if (reqId !== requestIdRef.current) return;
+
       if (opts?.pushHistory && result) {
         setNavStack((prev) => [...prev, result]);
         if (Platform.OS === 'web' && typeof globalThis.window !== 'undefined') {
@@ -280,10 +323,13 @@ function MainScreen() {
         setHistory(updated);
       }
     } catch (err) {
+      if (reqId !== requestIdRef.current) return;
       const msg = err instanceof Error ? err.message : 'No se pudo conectar con el servidor';
       setError(msg);
     } finally {
-      setLoading(false);
+      if (reqId === requestIdRef.current) {
+        setLoading(false);
+      }
     }
   };
 
@@ -291,7 +337,9 @@ function MainScreen() {
     episodeUrl: string,
     title?: string,
     thumbnail?: string,
+    refresh = false,
   ) => {
+    lastPickerRequestRef.current = { url: episodeUrl, title, thumbnail };
     setActionTarget(null);
     setPickerTitle(title);
     setPickerThumb(thumbnail);
@@ -301,7 +349,10 @@ function MainScreen() {
     setPickerVisible(true);
 
     try {
-      const data = await extractMediaFromUrl(backendUrl, episodeUrl, { pin: accessPin });
+      const data = await extractMediaFromUrl(backendUrl, episodeUrl, {
+        pin: accessPin,
+        refresh,
+      });
       const resolvedThumb = thumbnail || data.metadata.poster || data.images[0]?.url;
       if (resolvedThumb) setPickerThumb(resolvedThumb);
       if (data.videos.length === 0 && (data.pages?.length ?? 0) > 0) {
@@ -309,6 +360,7 @@ function MainScreen() {
         if (result) setNavStack((prev) => [...prev, result]);
         setResult(data);
         setSynopsisExpanded(false);
+        setEpisodeFilter('');
         return;
       }
       setPickerVideos(data.videos);
@@ -336,13 +388,20 @@ function MainScreen() {
   };
 
   const openInfoForLink = async (link: PageLink) => {
+    const reqId = ++requestIdRef.current;
     setActionTarget(null);
     setLoading(true);
     setError(null);
+    setEpisodeFilter('');
     try {
-      const firstData = await extractMediaFromUrl(backendUrl, link.url);
+      const firstData = await extractMediaFromUrl(backendUrl, link.url, { pin: accessPin });
+      if (reqId !== requestIdRef.current) return;
+
       if (firstData.metadata.infoUrl) {
-        const detailData = await extractMediaFromUrl(backendUrl, firstData.metadata.infoUrl);
+        const detailData = await extractMediaFromUrl(backendUrl, firstData.metadata.infoUrl, {
+          pin: accessPin,
+        });
+        if (reqId !== requestIdRef.current) return;
         if (result) {
           setNavStack((prev) => [...prev, result]);
           if (Platform.OS === 'web' && typeof globalThis.window !== 'undefined') {
@@ -362,9 +421,12 @@ function MainScreen() {
         setSynopsisExpanded(false);
       }
     } catch (err) {
+      if (reqId !== requestIdRef.current) return;
       setError(err instanceof Error ? err.message : 'No se pudo cargar la información');
     } finally {
-      setLoading(false);
+      if (reqId === requestIdRef.current) {
+        setLoading(false);
+      }
     }
   };
 
@@ -390,6 +452,7 @@ function MainScreen() {
       setNavStack((s) => s.slice(0, -1));
       setResult(prev);
       setSynopsisExpanded(false);
+      setEpisodeFilter('');
       return true;
     }
     if (returnTab) {
@@ -404,33 +467,47 @@ function MainScreen() {
     return false;
   };
 
-  // Handle Android hardware back button
+  const goBackRef = useRef(handleGoBack);
+  goBackRef.current = handleGoBack;
+
+  const canPopWebRef = useRef(false);
+  canPopWebRef.current =
+    navStack.length > 0 ||
+    Boolean(selectedItem) ||
+    pickerVisible ||
+    Boolean(actionTarget) ||
+    bottomTab !== 'home';
+
+  // Handle Android hardware back button (registered once)
   useEffect(() => {
     if (Platform.OS === 'web') return;
-    const sub = BackHandler.addEventListener('hardwareBackPress', () => handleGoBack());
+    const sub = BackHandler.addEventListener('hardwareBackPress', () => goBackRef.current());
     return () => sub.remove();
-  });
+  }, []);
 
-  // Handle Web browser back button (popstate)
+  // Handle Web browser back button (popstate — registered once)
   useEffect(() => {
     if (Platform.OS !== 'web' || typeof globalThis.window === 'undefined') return;
     const onPopState = () => {
-      if (navStack.length > 0 || selectedItem || pickerVisible || actionTarget || bottomTab !== 'home') {
-        handleGoBack();
+      if (canPopWebRef.current) {
+        goBackRef.current();
       }
     };
     globalThis.window.addEventListener('popstate', onPopState);
     return () => globalThis.window.removeEventListener('popstate', onPopState);
-  });
+  }, []);
 
   const handleGlobalSearch = async () => {
     const q = searchInput.trim();
     if (!q) return;
+    const reqId = ++requestIdRef.current;
     Keyboard.dismiss();
     setLoading(true);
     setError(null);
+    setEpisodeFilter('');
     try {
       const data = await globalSearchMedia(backendUrl, q, accessPin);
+      if (reqId !== requestIdRef.current) return;
       if (result) {
         setNavStack((prev) => [...prev, result]);
         if (Platform.OS === 'web' && typeof globalThis.window !== 'undefined') {
@@ -440,9 +517,12 @@ function MainScreen() {
       setResult(data);
       setBottomTab('home');
     } catch (err) {
+      if (reqId !== requestIdRef.current) return;
       setError(err instanceof Error ? err.message : 'Error en búsqueda global');
     } finally {
-      setLoading(false);
+      if (reqId === requestIdRef.current) {
+        setLoading(false);
+      }
     }
   };
 
@@ -527,6 +607,11 @@ function MainScreen() {
     return 'generic';
   }, [result]);
 
+  const pagesDescending = useMemo(
+    () => detectPagesDescending(result?.pages ?? []),
+    [result],
+  );
+
   const sortedEpisodes = useMemo(() => {
     const list = result?.pages ?? [];
     const ordered = episodesAsc ? [...list].reverse() : list;
@@ -544,22 +629,47 @@ function MainScreen() {
     return result.pages.findIndex((p) => p.url === viewerReferer);
   }, [viewerReferer, result]);
 
+  const hasPrevEpisode = useMemo(() => {
+    if (!result?.pages || currentEpisodeIndex < 0) return false;
+    return pagesDescending
+      ? currentEpisodeIndex + 1 < result.pages.length
+      : currentEpisodeIndex > 0;
+  }, [result, currentEpisodeIndex, pagesDescending]);
+
+  const hasNextEpisode = useMemo(() => {
+    if (!result?.pages || currentEpisodeIndex < 0) return false;
+    return pagesDescending
+      ? currentEpisodeIndex > 0
+      : currentEpisodeIndex + 1 < result.pages.length;
+  }, [result, currentEpisodeIndex, pagesDescending]);
+
   const handleStepEpisode = async (direction: 'prev' | 'next') => {
     if (!result?.pages || currentEpisodeIndex < 0) return;
-    // In AnimeFLV pages array is usually descending (20, 19, ..., 1)
-    const targetIdx =
-      direction === 'next' ? currentEpisodeIndex - 1 : currentEpisodeIndex + 1;
-    const targetEp = result.pages[targetIdx];
+    const delta =
+      direction === 'next'
+        ? pagesDescending
+          ? -1
+          : 1
+        : pagesDescending
+          ? 1
+          : -1;
+    const targetEp = result.pages[currentEpisodeIndex + delta];
     if (!targetEp) return;
     setSelectedItem(null);
-    await openServerPickerForUrl(targetEp.url, targetEp.title);
+    await openServerPickerForUrl(
+      targetEp.url,
+      targetEp.title,
+      targetEp.thumbnail || result.metadata.poster,
+    );
   };
 
   const handleLoadMore = async () => {
     if (!result?.nextPageUrl || loadingMore) return;
     setLoadingMore(true);
     try {
-      const more = await extractMediaFromUrl(backendUrl, result.nextPageUrl);
+      const more = await extractMediaFromUrl(backendUrl, result.nextPageUrl, {
+        pin: accessPin,
+      });
       const existingIds = new Set((result.pages ?? []).map((p) => p.id));
       const newPages = (more.pages ?? []).filter((p) => !existingIds.has(p.id));
       setResult({
@@ -619,16 +729,55 @@ function MainScreen() {
     return groups;
   }, [result]);
 
+  const handleDismissContinueWatching = async (url: string) => {
+    await removePlaybackProgress(url);
+    setContinueWatching((prev) => prev.filter((c) => c.url !== url));
+  };
+
+  const renderSkeletonGrid = () => {
+    const count = gridColumns * 3;
+    const items = Array.from({ length: count });
+    const rows: number[][] = [];
+    for (let i = 0; i < items.length; i += gridColumns) {
+      rows.push(
+        Array.from({ length: Math.min(gridColumns, items.length - i) }, (_, idx) => i + idx),
+      );
+    }
+    return (
+      <ScrollView
+        style={styles.flex1}
+        contentContainerStyle={[styles.gridContainer, isWide && styles.wideContainer]}
+      >
+        <View style={styles.skeletonStatusRow}>
+          <ActivityIndicator size="small" color="#818cf8" />
+          <Text style={styles.mutedText}>Cargando {activeSource.name}...</Text>
+        </View>
+        {rows.map((row, rIdx) => (
+          <View key={`sk-row-${rIdx}`} style={styles.dayGridRow}>
+            {row.map((idx) => (
+              <View key={`sk-${idx}`} style={[styles.posterCard, { flex: 1 / gridColumns }]}>
+                <View style={[styles.posterImg, styles.skeletonBlock]} />
+                <View style={styles.skeletonLine} />
+                <View style={[styles.skeletonLine, { width: '62%' }]} />
+              </View>
+            ))}
+          </View>
+        ))}
+      </ScrollView>
+    );
+  };
+
   const renderPosterCard = (item: PageLink) => {
     const thumbUri = item.thumbnail
       ? buildProxyUrl(backendUrl, item.thumbnail, result?.metadata.sourceUrl, accessPin)
       : undefined;
+    const mangaItem = isMangaLink(item.url, result?.adapter);
     return (
       <TouchableOpacity
         key={item.id}
         style={[styles.posterCard, { flex: 1 / gridColumns }]}
         onPress={() => {
-          if (result?.adapter === 'lectortmo') {
+          if (mangaItem) {
             void loadUrl(item.url, { pushHistory: true });
           } else {
             setActionTarget(item);
@@ -636,30 +785,39 @@ function MainScreen() {
         }}
         activeOpacity={0.85}
       >
-        {thumbUri ? (
-          <Image source={{ uri: thumbUri }} style={styles.posterImg} resizeMode="cover" />
-        ) : (
-          <View style={[styles.posterImg, styles.posterPlaceholder]}>
-            <Ionicons name="film-outline" size={28} color="#52525b" />
-          </View>
-        )}
+        <View style={styles.posterMediaWrap}>
+          {thumbUri ? (
+            <Image source={{ uri: thumbUri }} style={styles.posterImg} resizeMode="cover" />
+          ) : (
+            <View style={[styles.posterImg, styles.posterPlaceholder]}>
+              <Ionicons
+                name={mangaItem ? 'book-outline' : 'film-outline'}
+                size={28}
+                color="#52525b"
+              />
+            </View>
+          )}
+          {item.subtitle ? (
+            <View style={styles.posterBadge}>
+              <Text style={styles.posterBadgeText} numberOfLines={1}>
+                {item.subtitle}
+              </Text>
+            </View>
+          ) : null}
+        </View>
         <Text style={styles.posterTitle} numberOfLines={2}>
           {item.title}
         </Text>
-        {item.subtitle ? (
-          <Text style={styles.posterSub} numberOfLines={1}>
-            {item.subtitle}
-          </Text>
-        ) : null}
       </TouchableOpacity>
     );
   };
 
   const renderCatalogView = () => {
     const pages = result?.pages ?? [];
+    const allSources = [...FIXED_SOURCES, ...customSources];
     return (
       <View style={styles.flex1}>
-        {/* Top Source Bar (like Screenshot 1) */}
+        {/* Top Source Bar */}
         <View style={[styles.catalogHeader, isWide && styles.wideContainer]}>
           <View style={styles.sourceSwitchRow}>
             {navStack.length > 0 && (
@@ -673,7 +831,7 @@ function MainScreen() {
               </TouchableOpacity>
             )}
             {isWide ? (
-              [...FIXED_SOURCES, ...customSources].map((src) => {
+              allSources.map((src) => {
                 const selected = activeSource.id === src.id;
                 return (
                   <TouchableOpacity
@@ -693,40 +851,66 @@ function MainScreen() {
                 );
               })
             ) : (
-              <TouchableOpacity
-                style={styles.sourcePill}
-                onPress={() => setBottomTab('servers')}
-                activeOpacity={0.8}
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.mobileSourceStrip}
+                style={styles.mobileSourceScroll}
               >
-                <View style={[styles.sourceDot, { backgroundColor: activeSource.color }]}>
-                  <Ionicons name="play" size={11} color="#09090b" />
-                </View>
-                <Text style={styles.sourcePillText}>{activeSource.name}</Text>
-              </TouchableOpacity>
+                {allSources.map((src) => {
+                  const selected = activeSource.id === src.id;
+                  return (
+                    <TouchableOpacity
+                      key={src.id}
+                      style={[styles.sourcePill, selected && styles.sourcePillSelected]}
+                      onPress={() => {
+                        setActiveSource(src);
+                        void loadUrl(src.url, { silentHistory: true });
+                      }}
+                      activeOpacity={0.8}
+                    >
+                      <View style={[styles.sourceDot, { backgroundColor: src.color }]}>
+                        <Ionicons
+                          name={src.id === 'lectortmo' ? 'book' : 'play'}
+                          size={10}
+                          color="#09090b"
+                        />
+                      </View>
+                      <Text style={styles.sourcePillText}>{src.name}</Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </ScrollView>
             )}
           </View>
 
           <View style={styles.headerIcons}>
             <TouchableOpacity
-              style={styles.headerIconBtn}
+              style={[styles.headerIconBtn, searchOpen && styles.headerIconBtnActive]}
               onPress={() => setSearchOpen((v) => !v)}
             >
-              <Ionicons name="search" size={22} color="#e2e8f0" />
+              <Ionicons name="search" size={21} color={searchOpen ? '#818cf8' : '#e2e8f0'} />
             </TouchableOpacity>
             <TouchableOpacity
               style={styles.headerIconBtn}
               onPress={() =>
-                void loadUrl(activeSource.url, { silentHistory: true, refresh: true })
+                void loadUrl(result?.metadata.sourceUrl || activeSource.url, {
+                  silentHistory: true,
+                  refresh: true,
+                })
               }
             >
-              <Ionicons name="refresh" size={21} color="#e2e8f0" />
+              <Ionicons name="refresh" size={20} color="#e2e8f0" />
             </TouchableOpacity>
           </View>
         </View>
 
         {activeSource.sections && activeSource.sections.length > 0 && (
-          <View
-            style={[
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            style={styles.sectionsScroll}
+            contentContainerStyle={[
               styles.sectionsContainer,
               isWide && styles.wideContainer,
             ]}
@@ -752,22 +936,32 @@ function MainScreen() {
                 </TouchableOpacity>
               );
             })}
-          </View>
+          </ScrollView>
         )}
 
         {(searchOpen || isWide) && (
           <View style={[styles.searchBarRow, isWide && styles.wideContainer]}>
-            <TextInput
-              style={styles.searchInput}
-              value={searchInput}
-              onChangeText={setSearchInput}
-              placeholder={`Buscar en ${activeSource.name} o pegar URL...`}
-              placeholderTextColor="#71717a"
-              autoCapitalize="none"
-              autoCorrect={false}
-              returnKeyType="search"
-              onSubmitEditing={handleSearchSubmit}
-            />
+            <View style={styles.searchInputWrap}>
+              <TextInput
+                style={styles.searchInput}
+                value={searchInput}
+                onChangeText={setSearchInput}
+                placeholder={`Buscar en ${activeSource.name} o pegar URL...`}
+                placeholderTextColor="#71717a"
+                autoCapitalize="none"
+                autoCorrect={false}
+                returnKeyType="search"
+                onSubmitEditing={handleSearchSubmit}
+              />
+              {searchInput.length > 0 && (
+                <TouchableOpacity
+                  onPress={() => setSearchInput('')}
+                  style={styles.clearInputBtn}
+                >
+                  <Ionicons name="close-circle" size={17} color="#71717a" />
+                </TouchableOpacity>
+              )}
+            </View>
             <TouchableOpacity style={styles.searchGoBtn} onPress={handleSearchSubmit}>
               <Ionicons name="arrow-forward" size={18} color="#ffffff" />
             </TouchableOpacity>
@@ -807,17 +1001,31 @@ function MainScreen() {
                     }
                     activeOpacity={0.85}
                   >
-                    {thumbUri ? (
-                      <Image
-                        source={{ uri: thumbUri }}
-                        style={styles.cwImg}
-                        resizeMode="cover"
-                      />
-                    ) : (
-                      <View style={[styles.cwImg, styles.posterPlaceholder]}>
-                        <Ionicons name="play-circle" size={28} color="#818cf8" />
+                    <View style={styles.cwThumbWrap}>
+                      {thumbUri ? (
+                        <Image
+                          source={{ uri: thumbUri }}
+                          style={styles.cwImg}
+                          resizeMode="cover"
+                        />
+                      ) : (
+                        <View style={[styles.cwImg, styles.posterPlaceholder]}>
+                          <Ionicons name="play-circle" size={28} color="#818cf8" />
+                        </View>
+                      )}
+                      <View style={styles.cwRemBadge}>
+                        <Text style={styles.cwRemText}>
+                          {formatRemainingTime(cw.position, cw.duration)}
+                        </Text>
                       </View>
-                    )}
+                      <TouchableOpacity
+                        style={styles.cwDismissBtn}
+                        onPress={() => void handleDismissContinueWatching(cw.url)}
+                        hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                      >
+                        <Ionicons name="close" size={13} color="#f8fafc" />
+                      </TouchableOpacity>
+                    </View>
                     <View style={styles.cwBarTrack}>
                       <View style={[styles.cwBarFill, { width: `${ratio * 100}%` }]} />
                     </View>
@@ -836,16 +1044,13 @@ function MainScreen() {
             <Ionicons name="alert-circle-outline" size={18} color="#fca5a5" />
             <Text style={styles.errorText}>{error}</Text>
             <TouchableOpacity onPress={() => setSettingsVisible(true)}>
-              <Text style={styles.errorAction}>Configurar IP</Text>
+              <Text style={styles.errorAction}>Configurar</Text>
             </TouchableOpacity>
           </View>
         )}
 
         {loading && pages.length === 0 ? (
-          <View style={styles.centerBox}>
-            <ActivityIndicator size="large" color="#818cf8" />
-            <Text style={styles.mutedText}>Cargando {activeSource.name}...</Text>
-          </View>
+          renderSkeletonGrid()
         ) : groupedCatalogSections ? (
           <ScrollView
             style={styles.flex1}
@@ -853,6 +1058,18 @@ function MainScreen() {
               styles.gridContainer,
               isWide && styles.wideContainer,
             ]}
+            refreshControl={
+              <RefreshControl
+                refreshing={loading}
+                tintColor="#818cf8"
+                onRefresh={() =>
+                  void loadUrl(result?.metadata.sourceUrl || activeSource.url, {
+                    silentHistory: true,
+                    refresh: true,
+                  })
+                }
+              />
+            }
           >
             {groupedCatalogSections.map((sec) => {
               const rows: PageLink[][] = [];
@@ -910,46 +1127,10 @@ function MainScreen() {
             onRefresh={() =>
               void loadUrl(result?.metadata.sourceUrl || activeSource.url, {
                 silentHistory: true,
+                refresh: true,
               })
             }
-            renderItem={({ item }) => {
-              const thumbUri = item.thumbnail
-                ? buildProxyUrl(backendUrl, item.thumbnail, result?.metadata.sourceUrl)
-                : undefined;
-              return (
-                <TouchableOpacity
-                  style={[styles.posterCard, { flex: 1 / gridColumns }]}
-                  onPress={() => {
-                    if (result?.adapter === 'lectortmo') {
-                      void loadUrl(item.url, { pushHistory: true });
-                    } else {
-                      setActionTarget(item);
-                    }
-                  }}
-                  activeOpacity={0.85}
-                >
-                  {thumbUri ? (
-                    <Image
-                      source={{ uri: thumbUri }}
-                      style={styles.posterImg}
-                      resizeMode="cover"
-                    />
-                  ) : (
-                    <View style={[styles.posterImg, styles.posterPlaceholder]}>
-                      <Ionicons name="film-outline" size={28} color="#52525b" />
-                    </View>
-                  )}
-                  <Text style={styles.posterTitle} numberOfLines={2}>
-                    {item.title}
-                  </Text>
-                  {item.subtitle ? (
-                    <Text style={styles.posterSub} numberOfLines={1}>
-                      {item.subtitle}
-                    </Text>
-                  ) : null}
-                </TouchableOpacity>
-              );
-            }}
+            renderItem={({ item }) => renderPosterCard(item)}
             ListFooterComponent={
               result?.nextPageUrl ? (
                 <TouchableOpacity
@@ -989,15 +1170,23 @@ function MainScreen() {
     if (!result) return null;
     const posterRaw = result.metadata.poster || result.images[0]?.url;
     const posterUri = posterRaw
-      ? buildProxyUrl(backendUrl, posterRaw, result.metadata.sourceUrl)
+      ? buildProxyUrl(backendUrl, posterRaw, result.metadata.sourceUrl, accessPin)
       : undefined;
+
+    const allPages = result.pages ?? [];
+    const isMangaDetail = result.adapter === 'lectortmo';
+    const watchedCount = allPages.filter((p) => watchedUrls.includes(p.url)).length;
+    const chronologicalPages = pagesDescending ? [...allPages].reverse() : allPages;
+    const nextUnwatchedEp =
+      chronologicalPages.find((ep) => !watchedUrls.includes(ep.url)) ??
+      chronologicalPages[0];
 
     return (
       <ScrollView
         style={styles.flex1}
         contentContainerStyle={[styles.detailScroll, isWide && styles.wideContainer]}
       >
-        {/* Blurred Backdrop Hero (Screenshot 4) */}
+        {/* Blurred Backdrop Hero */}
         <View style={styles.heroContainer}>
           {posterUri ? (
             <Image
@@ -1036,7 +1225,7 @@ function MainScreen() {
               />
             ) : (
               <View style={[styles.detailPoster, styles.posterPlaceholder]}>
-                <Ionicons name="tv-outline" size={32} color="#71717a" />
+                <Ionicons name={isMangaDetail ? 'book-outline' : 'tv-outline'} size={32} color="#71717a" />
               </View>
             )}
             <View style={styles.heroTitleBlock}>
@@ -1046,6 +1235,21 @@ function MainScreen() {
               <Text style={styles.detailSub}>
                 {result.metadata.status || result.metadata.siteName || 'En emisión'}
               </Text>
+              {allPages.length > 0 && (
+                <View style={styles.progressSummaryWrap}>
+                  <Text style={styles.progressSummaryText}>
+                    {watchedCount} / {allPages.length} {isMangaDetail ? 'leídos' : 'vistos'}
+                  </Text>
+                  <View style={styles.progressSummaryTrack}>
+                    <View
+                      style={[
+                        styles.progressSummaryFill,
+                        { width: `${Math.round((watchedCount / allPages.length) * 100)}%` },
+                      ]}
+                    />
+                  </View>
+                </View>
+              )}
             </View>
           </View>
         </View>
@@ -1056,6 +1260,7 @@ function MainScreen() {
             style={styles.watchNowBtn}
             onPress={() => {
               setPickerTitle(result.metadata.title);
+              setPickerThumb(result.metadata.poster || result.images[0]?.url);
               setPickerVideos(result.videos);
               setPickerReferer(result.metadata.sourceUrl);
               setPickerLoading(false);
@@ -1065,6 +1270,31 @@ function MainScreen() {
             <Ionicons name="play-circle" size={22} color="#ffffff" />
             <Text style={styles.watchNowText}>
               Reproducir ahora ({result.videos.length} opciones)
+            </Text>
+          </TouchableOpacity>
+        )}
+
+        {/* Smart Continue / Start Next Episode CTA */}
+        {result.videos.length === 0 && nextUnwatchedEp && (
+          <TouchableOpacity
+            style={styles.watchNowBtn}
+            onPress={() => {
+              if (isMangaDetail) {
+                void markEpisodeWatched(nextUnwatchedEp.url).then(setWatchedUrls);
+                void loadUrl(nextUnwatchedEp.url, { pushHistory: true });
+              } else {
+                void openServerPickerForUrl(
+                  nextUnwatchedEp.url,
+                  nextUnwatchedEp.title,
+                  nextUnwatchedEp.thumbnail || result.metadata.poster,
+                );
+              }
+            }}
+          >
+            <Ionicons name={isMangaDetail ? 'book' : 'play-circle'} size={21} color="#ffffff" />
+            <Text style={styles.watchNowText} numberOfLines={1}>
+              {watchedCount > 0 ? 'Continuar' : isMangaDetail ? 'Leer' : 'Ver'}:{' '}
+              {nextUnwatchedEp.title}
             </Text>
           </TouchableOpacity>
         )}
@@ -1087,20 +1317,25 @@ function MainScreen() {
           </View>
         ) : null}
 
-        {/* Episodios */}
+        {/* Episodios / Capítulos */}
         <View style={styles.episodesSection}>
           <View style={styles.episodesHeaderRow}>
-            <Text style={styles.detailSectionTitle}>
-              Episodios ({sortedEpisodes.length})
-            </Text>
+            <View>
+              <Text style={styles.detailSectionTitle}>
+                {isMangaDetail ? 'Capítulos' : 'Episodios'} ({sortedEpisodes.length})
+              </Text>
+              <Text style={styles.epHintText}>Mantén pulsado para marcar como visto</Text>
+            </View>
             <View style={styles.episodesControlsRow}>
               <TextInput
                 style={styles.epFilterInput}
                 value={episodeFilter}
                 onChangeText={setEpisodeFilter}
-                placeholder="N°"
+                placeholder="Buscar"
                 placeholderTextColor="#71717a"
-                keyboardType="numeric"
+                keyboardType="default"
+                autoCapitalize="none"
+                autoCorrect={false}
               />
               <TouchableOpacity
                 onPress={() => setEpisodesAsc((v) => !v)}
@@ -1127,7 +1362,7 @@ function MainScreen() {
                     watched && styles.episodePillWatched,
                   ]}
                   onPress={() => {
-                    if (result.adapter === 'lectortmo') {
+                    if (isMangaDetail) {
                       void markEpisodeWatched(ep.url).then(setWatchedUrls);
                       void loadUrl(ep.url, { pushHistory: true });
                     } else {
@@ -1138,11 +1373,20 @@ function MainScreen() {
                       );
                     }
                   }}
+                  onLongPress={() => {
+                    void toggleEpisodeWatched(ep.url).then(setWatchedUrls);
+                  }}
                   activeOpacity={0.75}
                 >
                   <Ionicons
-                    name={watched ? 'checkmark-circle' : 'play-circle-outline'}
-                    size={24}
+                    name={
+                      watched
+                        ? 'checkmark-circle'
+                        : isMangaDetail
+                          ? 'book-outline'
+                          : 'play-circle-outline'
+                    }
+                    size={22}
                     color={watched ? '#4ade80' : '#cbd5e1'}
                   />
                   <Text
@@ -1229,7 +1473,7 @@ function MainScreen() {
               {item.type === 'image' ? (
                 <Image
                   source={{
-                    uri: buildProxyUrl(backendUrl, item.url, result.metadata.sourceUrl),
+                    uri: buildProxyUrl(backendUrl, item.url, result.metadata.sourceUrl, accessPin),
                   }}
                   style={styles.genericThumb}
                 />
@@ -1259,7 +1503,10 @@ function MainScreen() {
   };
 
   const renderServersTab = () => (
-    <ScrollView style={styles.flex1} contentContainerStyle={styles.tabPageContent}>
+    <ScrollView
+      style={styles.flex1}
+      contentContainerStyle={[styles.tabPageContent, isWide && styles.wideContainer]}
+    >
       <View style={styles.tabPageHeader}>
         <Text style={styles.tabPageTitle}>Páginas fijas y URLs</Text>
         <TouchableOpacity
@@ -1284,7 +1531,11 @@ function MainScreen() {
             }}
           >
             <View style={[styles.fixedSourceIcon, { backgroundColor: src.color }]}>
-              <Ionicons name="tv" size={20} color="#09090b" />
+              <Ionicons
+                name={src.id === 'lectortmo' ? 'book' : 'tv'}
+                size={20}
+                color="#09090b"
+              />
             </View>
             <View style={styles.flex1}>
               <Text style={styles.fixedSourceName}>{src.name}</Text>
@@ -1342,12 +1593,19 @@ function MainScreen() {
   );
 
   const renderSavedListTab = (mode: 'favorites' | 'history') => {
-    const list = mode === 'favorites' ? favorites : history;
+    const rawList = mode === 'favorites' ? favorites : history;
+    const q = savedSearchQuery.trim().toLowerCase();
+    const list = q
+      ? rawList.filter((item) => item.title.toLowerCase().includes(q))
+      : rawList;
+
     return (
       <View style={styles.flex1}>
         <View style={[styles.tabPageHeader, isWide && styles.wideContainer]}>
           <Text style={styles.tabPageTitle}>
-            {mode === 'favorites' ? 'Favoritos' : 'Historial'}
+            {mode === 'favorites'
+              ? `Favoritos (${favorites.length})`
+              : `Historial (${history.length})`}
           </Text>
           {mode === 'history' && history.length > 0 && (
             <TouchableOpacity
@@ -1360,6 +1618,30 @@ function MainScreen() {
             </TouchableOpacity>
           )}
         </View>
+
+        {rawList.length > 3 && (
+          <View style={[styles.searchBarRow, isWide && styles.wideContainer]}>
+            <View style={styles.searchInputWrap}>
+              <TextInput
+                style={styles.searchInput}
+                value={savedSearchQuery}
+                onChangeText={setSavedSearchQuery}
+                placeholder={`Filtrar ${mode === 'favorites' ? 'favoritos' : 'historial'}...`}
+                placeholderTextColor="#71717a"
+                autoCapitalize="none"
+                autoCorrect={false}
+              />
+              {savedSearchQuery.length > 0 && (
+                <TouchableOpacity
+                  onPress={() => setSavedSearchQuery('')}
+                  style={styles.clearInputBtn}
+                >
+                  <Ionicons name="close-circle" size={17} color="#71717a" />
+                </TouchableOpacity>
+              )}
+            </View>
+          </View>
+        )}
 
         <FlatList
           key={`saved-${mode}-${gridColumns}`}
@@ -1384,21 +1666,36 @@ function MainScreen() {
                 }}
                 activeOpacity={0.85}
               >
-                {thumbUri ? (
-                  <Image
-                    source={{ uri: thumbUri }}
-                    style={styles.posterImg}
-                    resizeMode="cover"
-                  />
-                ) : (
-                  <View style={[styles.posterImg, styles.posterPlaceholder]}>
-                    <Ionicons
-                      name={mode === 'favorites' ? 'heart' : 'time-outline'}
-                      size={30}
-                      color={mode === 'favorites' ? '#f43f5e' : '#818cf8'}
+                <View style={styles.posterMediaWrap}>
+                  {thumbUri ? (
+                    <Image
+                      source={{ uri: thumbUri }}
+                      style={styles.posterImg}
+                      resizeMode="cover"
                     />
-                  </View>
-                )}
+                  ) : (
+                    <View style={[styles.posterImg, styles.posterPlaceholder]}>
+                      <Ionicons
+                        name={mode === 'favorites' ? 'heart' : 'time-outline'}
+                        size={30}
+                        color={mode === 'favorites' ? '#f43f5e' : '#818cf8'}
+                      />
+                    </View>
+                  )}
+                  <TouchableOpacity
+                    style={styles.savedRemoveBtn}
+                    onPress={() => {
+                      if (mode === 'favorites') {
+                        void toggleFavorite(item).then(setFavorites);
+                      } else {
+                        void removeHistoryEntry(item.url).then(setHistory);
+                      }
+                    }}
+                    hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                  >
+                    <Ionicons name="close" size={13} color="#f8fafc" />
+                  </TouchableOpacity>
+                </View>
                 <Text style={styles.posterTitle} numberOfLines={2}>
                   {item.title}
                 </Text>
@@ -1413,9 +1710,11 @@ function MainScreen() {
                 color="#52525b"
               />
               <Text style={styles.mutedText}>
-                {mode === 'favorites'
-                  ? 'Todavía no tienes favoritos guardados.'
-                  : 'Tu historial está vacío.'}
+                {q
+                  ? `Sin coincidencias para "${savedSearchQuery}".`
+                  : mode === 'favorites'
+                    ? 'Todavía no tienes favoritos guardados.'
+                    : 'Tu historial está vacío.'}
               </Text>
             </View>
           }
@@ -1429,8 +1728,11 @@ function MainScreen() {
     const parentManga = navStack.length > 0 ? navStack[navStack.length - 1] : null;
     const chapters = parentManga?.pages ?? [];
     const curIdx = chapters.findIndex((c) => c.url === result.metadata.sourceUrl);
-    const hasPrev = curIdx > 0;
-    const hasNext = curIdx >= 0 && curIdx + 1 < chapters.length;
+    const chaptersDesc = detectPagesDescending(chapters);
+    const prevIdx = chaptersDesc ? curIdx + 1 : curIdx - 1;
+    const nextIdx = chaptersDesc ? curIdx - 1 : curIdx + 1;
+    const hasPrev = curIdx >= 0 && prevIdx >= 0 && prevIdx < chapters.length;
+    const hasNext = curIdx >= 0 && nextIdx >= 0 && nextIdx < chapters.length;
 
     return (
       <MangaReaderView
@@ -1443,13 +1745,13 @@ function MainScreen() {
         hasNext={hasNext}
         onPrev={() => {
           if (!hasPrev) return;
-          const prevChap = chapters[curIdx - 1];
+          const prevChap = chapters[prevIdx];
           void markEpisodeWatched(prevChap.url).then(setWatchedUrls);
           void loadUrl(prevChap.url, { preserveStack: true });
         }}
         onNext={() => {
           if (!hasNext) return;
-          const nextChap = chapters[curIdx + 1];
+          const nextChap = chapters[nextIdx];
           void markEpisodeWatched(nextChap.url).then(setWatchedUrls);
           void loadUrl(nextChap.url, { preserveStack: true });
         }}
@@ -1457,6 +1759,11 @@ function MainScreen() {
       />
     );
   };
+
+  const isActionTargetFav = useMemo(() => {
+    if (!actionTarget) return false;
+    return favorites.some((f) => f.url === actionTarget.url);
+  }, [actionTarget, favorites]);
 
   return (
     <SafeAreaView style={styles.container} edges={['top', 'left', 'right']}>
@@ -1476,7 +1783,7 @@ function MainScreen() {
         {bottomTab === 'history' && renderSavedListTab('history')}
       </View>
 
-      {/* Bottom Navigation Bar (Screenshot 1) */}
+      {/* Bottom Navigation Bar */}
       <SafeAreaView edges={['bottom']} style={styles.bottomBar}>
         {(
           [
@@ -1491,7 +1798,10 @@ function MainScreen() {
             <TouchableOpacity
               key={tab.key}
               style={styles.bottomTabBtn}
-              onPress={() => setBottomTab(tab.key)}
+              onPress={() => {
+                if (tab.key !== bottomTab) setSavedSearchQuery('');
+                setBottomTab(tab.key);
+              }}
             >
               <View style={[styles.bottomPill, active && styles.bottomPillActive]}>
                 <Ionicons
@@ -1508,7 +1818,7 @@ function MainScreen() {
         })}
       </SafeAreaView>
 
-      {/* Quick Action Menu ("Ver" / "Información" - Screenshot 2) */}
+      {/* Quick Action Menu ("Ver" / "Información" / "Favoritos") */}
       <Modal
         visible={Boolean(actionTarget)}
         transparent
@@ -1550,11 +1860,36 @@ function MainScreen() {
               <Ionicons name="information-circle-outline" size={20} color="#f1f5f9" />
               <Text style={styles.actionText}>Información</Text>
             </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.actionRow}
+              onPress={() => {
+                if (actionTarget) {
+                  const target = actionTarget;
+                  setActionTarget(null);
+                  void toggleFavorite({
+                    url: target.url,
+                    title: target.title,
+                    thumbnail: target.thumbnail,
+                    savedAt: Date.now(),
+                    counts: { videos: 0, images: 0, pdfs: 0 },
+                  }).then(setFavorites);
+                }
+              }}
+            >
+              <Ionicons
+                name={isActionTargetFav ? 'heart' : 'heart-outline'}
+                size={20}
+                color={isActionTargetFav ? '#f43f5e' : '#f1f5f9'}
+              />
+              <Text style={styles.actionText}>
+                {isActionTargetFav ? 'Quitar de Favoritos' : 'Añadir a Favoritos'}
+              </Text>
+            </TouchableOpacity>
           </View>
         </TouchableOpacity>
       </Modal>
 
-      {/* Server Picker Modal ("Reprod. Interno" - Screenshot 3) */}
+      {/* Server Picker Modal */}
       <ServerPickerModal
         visible={pickerVisible}
         title={pickerTitle}
@@ -1564,6 +1899,12 @@ function MainScreen() {
           setPickerVisible(false);
           setViewerReferer(pickerReferer);
           setSelectedItem(video);
+        }}
+        onRetry={() => {
+          const last = lastPickerRequestRef.current;
+          if (last) {
+            void openServerPickerForUrl(last.url, last.title, last.thumbnail, true);
+          }
         }}
         onClose={() => setPickerVisible(false)}
       />
@@ -1578,10 +1919,8 @@ function MainScreen() {
         episodeThumbnail={pickerThumb || result?.metadata.poster || result?.images[0]?.url}
         serverOptions={pickerVideos}
         onSelectServer={(srv) => setSelectedItem(srv)}
-        hasPrevEpisode={
-          Boolean(result?.pages && currentEpisodeIndex >= 0 && currentEpisodeIndex + 1 < result.pages.length)
-        }
-        hasNextEpisode={Boolean(result?.pages && currentEpisodeIndex > 0)}
+        hasPrevEpisode={hasPrevEpisode}
+        hasNextEpisode={hasNextEpisode}
         onPrevEpisode={() => void handleStepEpisode('prev')}
         onNextEpisode={() => void handleStepEpisode('next')}
         onWatched={(epUrl) => {
@@ -1621,10 +1960,21 @@ const styles = StyleSheet.create({
     alignSelf: 'center',
   },
   sourceSwitchRow: {
+    flex: 1,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
-    flexWrap: 'wrap',
+    flexWrap: 'nowrap',
+    overflow: 'hidden',
+  },
+  mobileSourceScroll: {
+    flex: 1,
+  },
+  mobileSourceStrip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 7,
+    paddingRight: 6,
   },
   sourcePillSelected: {
     backgroundColor: '#363b54',
@@ -1691,16 +2041,18 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 6,
   },
+  sectionsScroll: {
+    flexGrow: 0,
+  },
   sectionsContainer: {
     flexDirection: 'row',
-    flexWrap: 'wrap',
     paddingHorizontal: 14,
     paddingBottom: 10,
     gap: 8,
   },
   sectionChip: {
     paddingHorizontal: 14,
-    paddingVertical: 8,
+    paddingVertical: 7,
     borderRadius: 18,
     backgroundColor: '#1e212d',
     borderWidth: 1,
@@ -1720,6 +2072,10 @@ const styles = StyleSheet.create({
   },
   headerIconBtn: {
     padding: 8,
+    borderRadius: 12,
+  },
+  headerIconBtnActive: {
+    backgroundColor: 'rgba(99, 102, 241, 0.2)',
   },
   searchBarRow: {
     flexDirection: 'row',
@@ -1728,16 +2084,25 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     paddingBottom: 10,
   },
-  searchInput: {
+  searchInputWrap: {
     flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
     backgroundColor: '#1e212d',
     borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#2d3142',
+    paddingRight: 6,
+  },
+  searchInput: {
+    flex: 1,
     paddingHorizontal: 14,
     paddingVertical: 10,
     color: '#f8fafc',
     fontSize: 14,
-    borderWidth: 1,
-    borderColor: '#2d3142',
+  },
+  clearInputBtn: {
+    padding: 4,
   },
   searchGoBtn: {
     backgroundColor: '#6366f1',
@@ -2278,5 +2643,110 @@ const styles = StyleSheet.create({
     color: '#e2e8f0',
     fontSize: 14,
     fontWeight: '600',
+  },
+  cwThumbWrap: {
+    position: 'relative',
+    width: 132,
+    height: 78,
+  },
+  cwRemBadge: {
+    position: 'absolute',
+    left: 5,
+    bottom: 5,
+    backgroundColor: 'rgba(9, 9, 11, 0.8)',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 6,
+  },
+  cwRemText: {
+    color: '#e2e8f0',
+    fontSize: 10,
+    fontWeight: '700',
+  },
+  cwDismissBtn: {
+    position: 'absolute',
+    top: 4,
+    right: 4,
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: 'rgba(9, 9, 11, 0.78)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  skeletonStatusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    paddingVertical: 6,
+  },
+  skeletonBlock: {
+    backgroundColor: '#1f2332',
+    borderWidth: 1,
+    borderColor: '#282d3f',
+  },
+  skeletonLine: {
+    height: 11,
+    borderRadius: 5,
+    backgroundColor: '#1f2332',
+    marginBottom: 5,
+    width: '90%',
+  },
+  posterMediaWrap: {
+    position: 'relative',
+  },
+  posterBadge: {
+    position: 'absolute',
+    left: 5,
+    bottom: 11,
+    maxWidth: '88%',
+    backgroundColor: 'rgba(15, 23, 42, 0.86)',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: 'rgba(129, 140, 248, 0.35)',
+  },
+  posterBadgeText: {
+    color: '#e0e7ff',
+    fontSize: 10,
+    fontWeight: '700',
+  },
+  savedRemoveBtn: {
+    position: 'absolute',
+    top: 5,
+    right: 5,
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    backgroundColor: 'rgba(15, 23, 42, 0.82)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  progressSummaryWrap: {
+    marginTop: 4,
+    gap: 4,
+  },
+  progressSummaryText: {
+    color: '#cbd5e1',
+    fontSize: 11.5,
+    fontWeight: '600',
+  },
+  progressSummaryTrack: {
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: 'rgba(255,255,255,0.18)',
+    overflow: 'hidden',
+  },
+  progressSummaryFill: {
+    height: '100%',
+    backgroundColor: '#4ade80',
+    borderRadius: 2,
+  },
+  epHintText: {
+    color: '#64748b',
+    fontSize: 11,
+    marginTop: 1,
   },
 });

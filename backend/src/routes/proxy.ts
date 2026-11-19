@@ -8,17 +8,24 @@ const DEFAULT_USER_AGENT =
 
 export const proxyRouter = Router();
 
-function buildProxyLink(baseOrigin: string, targetUrl: string, referer?: string): string {
+function buildProxyLink(
+  baseOrigin: string,
+  targetUrl: string,
+  referer?: string,
+  pin?: string,
+): string {
   const params = new URLSearchParams({ url: targetUrl });
   if (referer) params.set('referer', referer);
+  if (pin) params.set('pin', pin);
   return `${baseOrigin}/api/proxy?${params.toString()}`;
 }
 
-function rewriteHlsPlaylist(
+export function rewriteHlsPlaylist(
   playlist: string,
   playlistUrl: URL,
   proxyBaseOrigin: string,
   referer?: string,
+  pin?: string,
 ): string {
   const lines = playlist.split(/\r?\n/);
 
@@ -70,7 +77,7 @@ function rewriteHlsPlaylist(
         return line.replace(/URI="([^"]+)"/gi, (_, rawUri: string) => {
           try {
             const abs = new URL(rawUri, playlistUrl).toString();
-            return `URI="${buildProxyLink(proxyBaseOrigin, abs, referer)}"`;
+            return `URI="${buildProxyLink(proxyBaseOrigin, abs, referer, pin)}"`;
           } catch {
             return `URI="${rawUri}"`;
           }
@@ -80,7 +87,7 @@ function rewriteHlsPlaylist(
       // Rewrite segment or sub-playlist URL line
       try {
         const abs = new URL(trimmed, playlistUrl).toString();
-        return buildProxyLink(proxyBaseOrigin, abs, referer);
+        return buildProxyLink(proxyBaseOrigin, abs, referer, pin);
       } catch {
         return line;
       }
@@ -91,11 +98,23 @@ function rewriteHlsPlaylist(
 proxyRouter.get('/', async (req: Request, res: Response) => {
   const rawUrl = req.query.url;
   const rawReferer = req.query.referer;
+  const rawPin =
+    (typeof req.query.pin === 'string' && req.query.pin.trim()) ||
+    (typeof req.headers['x-access-pin'] === 'string' && req.headers['x-access-pin'].trim()) ||
+    undefined;
 
   if (typeof rawUrl !== 'string' || !rawUrl.trim()) {
     res.status(400).json({ error: 'Falta el parámetro "url"' });
     return;
   }
+
+  const connectController = new AbortController();
+  const onClientClose = () => {
+    if (!res.writableEnded) {
+      connectController.abort();
+    }
+  };
+  req.on('close', onClientClose);
 
   try {
     const targetUrl = validateTargetUrl(rawUrl);
@@ -131,7 +150,6 @@ proxyRouter.get('/', async (req: Request, res: Response) => {
       headers.Range = req.headers.range;
     }
 
-    const connectController = new AbortController();
     const connectTimer = setTimeout(() => connectController.abort(), 20000);
     let upstream: globalThis.Response;
     try {
@@ -157,7 +175,7 @@ proxyRouter.get('/', async (req: Request, res: Response) => {
       targetUrl.pathname.toLowerCase().endsWith('.m3u8') ||
       targetUrl.pathname.toLowerCase().includes('/m3u8/');
 
-    // Rewrite HLS playlists so segments also route through /api/proxy with Referer/Origin
+    // Rewrite HLS playlists so segments also route through /api/proxy with Referer/Origin & PIN
     if (isHlsPlaylist && upstream.ok) {
       const text = await upstream.text();
       if (text.trimStart().startsWith('#EXTM3U')) {
@@ -168,6 +186,7 @@ proxyRouter.get('/', async (req: Request, res: Response) => {
           targetUrl,
           proxyOrigin,
           validReferer || `${targetUrl.origin}/`,
+          rawPin,
         );
         res.status(200);
         res.setHeader('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
@@ -181,6 +200,7 @@ proxyRouter.get('/', async (req: Request, res: Response) => {
 
     res.status(upstream.status);
 
+    let hasCacheControl = false;
     const forwardHeaders = [
       'content-type',
       'content-length',
@@ -191,6 +211,7 @@ proxyRouter.get('/', async (req: Request, res: Response) => {
     for (const h of forwardHeaders) {
       const value = upstream.headers.get(h);
       if (value) {
+        if (h === 'cache-control') hasCacheControl = true;
         if (h === 'content-type' && value.includes('application/octet-stream')) {
           const lowerPath = targetUrl.pathname.toLowerCase();
           if (lowerPath.endsWith('.mp4')) {
@@ -205,9 +226,25 @@ proxyRouter.get('/', async (req: Request, res: Response) => {
             res.setHeader(h, 'application/pdf');
             continue;
           }
+          if (lowerPath.endsWith('.webp')) {
+            res.setHeader(h, 'image/webp');
+            continue;
+          }
+          if (lowerPath.endsWith('.jpg') || lowerPath.endsWith('.jpeg')) {
+            res.setHeader(h, 'image/jpeg');
+            continue;
+          }
+          if (lowerPath.endsWith('.png')) {
+            res.setHeader(h, 'image/png');
+            continue;
+          }
         }
         res.setHeader(h, value);
       }
+    }
+
+    if (!hasCacheControl && upstreamCt.startsWith('image/')) {
+      res.setHeader('Cache-Control', 'public, max-age=3600');
     }
 
     if (!upstream.body) {
@@ -230,9 +267,14 @@ proxyRouter.get('/', async (req: Request, res: Response) => {
 
     nodeStream.pipe(res);
   } catch (err) {
+    if (connectController.signal.aborted && res.writableEnded) {
+      return;
+    }
     const message = err instanceof Error ? err.message : 'Error al proxificar el recurso';
     if (!res.headersSent) {
       res.status(502).json({ error: message });
     }
+  } finally {
+    req.off('close', onClientClose);
   }
 });

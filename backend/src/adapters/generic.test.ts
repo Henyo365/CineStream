@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { resolveVideoStream, unpackPacker } from '../services/videoResolver.js';
+import { rewriteHlsPlaylist } from '../routes/proxy.js';
+import {
+  extractDirectStreamFromText,
+  resolveVideoStream,
+  unpackPacker,
+} from '../services/videoResolver.js';
 import { validateTargetUrl } from '../utils/url.js';
 import { extractFromHtml } from './index.js';
 
@@ -186,4 +191,52 @@ test('lectortmoAdapter extracts manga detail chapters and chapter reader images'
   assert.equal(chap.adapter, 'lectortmo');
   assert.equal(chap.images.length, 2);
   assert.equal(chap.images[0].url, 'https://repelishd.onl/mangax/001.webp');
+});
+
+test('validateTargetUrl blocks IPv6 loopback, ULA, and IPv4-mapped loopback', () => {
+  assert.throws(() => validateTargetUrl('http://[::1]:3001/secret'));
+  assert.throws(() => validateTargetUrl('http://[fc00::1]/admin'));
+  assert.throws(() => validateTargetUrl('http://[fe80::1]/meta'));
+  assert.throws(() => validateTargetUrl('http://[::ffff:127.0.0.1]/local'));
+  assert.throws(() => validateTargetUrl('http://0.0.0.0:8080/'));
+});
+
+test('rewriteHlsPlaylist sorts variants descending and preserves access pin', () => {
+  const playlist = [
+    '#EXTM3U',
+    '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="ES",URI="audio/es.m3u8"',
+    '#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360',
+    'low/index.m3u8',
+    '#EXT-X-STREAM-INF:BANDWIDTH=3500000,RESOLUTION=1920x1080',
+    'high/index.m3u8',
+  ].join('\n');
+
+  const rewritten = rewriteHlsPlaylist(
+    playlist,
+    new URL('https://cdn.example.com/stream/master.m3u8'),
+    'https://api.myapp.com',
+    'https://embed.example.com/',
+    '1234',
+  );
+
+  const lines = rewritten.split('\n');
+  assert.ok(lines[1].includes('pin=1234'));
+  assert.ok(lines[2].includes('BANDWIDTH=3500000'));
+  assert.ok(lines[3].includes('high%2Findex.m3u8'));
+  assert.ok(lines[3].includes('pin=1234'));
+  assert.ok(lines[4].includes('BANDWIDTH=800000'));
+});
+
+test('extractDirectStreamFromText handles JSON-escaped HLS URLs and og:video mp4', () => {
+  const escaped = `{"sources":[{"file":"https:\\/\\/cdn.video.io\\/hls\\/master.m3u8?t=1"}]}`;
+  const foundHls = extractDirectStreamFromText(escaped);
+  assert.ok(foundHls);
+  assert.equal(foundHls.url, 'https://cdn.video.io/hls/master.m3u8?t=1');
+  assert.equal(foundHls.mimeType, 'application/x-mpegURL');
+
+  const ogHtml = `<meta property="og:video" content="https://cdn.yourupload.com/file/123.mp4" />`;
+  const foundMp4 = extractDirectStreamFromText(ogHtml);
+  assert.ok(foundMp4);
+  assert.equal(foundMp4.url, 'https://cdn.yourupload.com/file/123.mp4');
+  assert.equal(foundMp4.mimeType, 'video/mp4');
 });

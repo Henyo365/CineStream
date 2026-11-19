@@ -8,7 +8,37 @@ const PRIVATE_IPV4_PREFIXES = [
   /^169\.254\./,
   /^0\./,
   /^172\.(1[6-9]|2\d|3[0-1])\./,
+  /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./,
 ];
+
+function isPrivateIpv6(rawHost: string): boolean {
+  const host = rawHost.replace(/^\[|\]$/g, '').toLowerCase();
+  if (!net.isIPv6(host)) return false;
+  if (host === '::1' || host === '::' || host === '0:0:0:0:0:0:0:1' || host === '0:0:0:0:0:0:0:0') {
+    return true;
+  }
+  // Unique local addresses (fc00::/7) and link-local (fe80::/10)
+  if (host.startsWith('fc') || host.startsWith('fd') || /^fe[89ab]/i.test(host)) {
+    return true;
+  }
+  // IPv4-mapped IPv6 (e.g. ::ffff:127.0.0.1 or ::ffff:7f00:1)
+  if (host.startsWith('::ffff:')) {
+    const mapped = host.slice(7);
+    if (net.isIPv4(mapped) && PRIVATE_IPV4_PREFIXES.some((rx) => rx.test(mapped))) {
+      return true;
+    }
+    const hexMatch = mapped.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+    if (hexMatch) {
+      const hi = parseInt(hexMatch[1], 16);
+      const lo = parseInt(hexMatch[2], 16);
+      const ipv4 = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+      if (PRIVATE_IPV4_PREFIXES.some((rx) => rx.test(ipv4))) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
 
 /**
  * Validates that a URL is http(s) and not targeting private/loopback addresses
@@ -29,11 +59,13 @@ export function validateTargetUrl(rawUrl: string): URL {
   const allowPrivate = process.env.ALLOW_PRIVATE_NETWORKS === 'true';
   if (!allowPrivate) {
     const hostname = parsed.hostname.toLowerCase();
+    const unbracketed = hostname.replace(/^\[|\]$/g, '');
     if (
-      hostname === 'localhost' ||
-      hostname === '::1' ||
-      hostname.endsWith('.local') ||
-      (net.isIPv4(hostname) && PRIVATE_IPV4_PREFIXES.some((rx) => rx.test(hostname)))
+      unbracketed === 'localhost' ||
+      unbracketed.endsWith('.local') ||
+      unbracketed.endsWith('.internal') ||
+      (net.isIPv4(unbracketed) && PRIVATE_IPV4_PREFIXES.some((rx) => rx.test(unbracketed))) ||
+      isPrivateIpv6(hostname)
     ) {
       throw new Error('No se permiten direcciones locales o privadas');
     }

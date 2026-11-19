@@ -7,8 +7,18 @@ import { extractFilename, makeMediaId, validateTargetUrl } from '../utils/url.js
 export const extractRouter = Router();
 
 const CACHE_TTL_MS = 5 * 60 * 1000;
-const MAX_CACHE_ENTRIES = 100;
+const MAX_CACHE_ENTRIES = 200;
 const extractCache = new Map<string, { data: ExtractionResult; expiresAt: number }>();
+const inFlightExtractions = new Map<string, Promise<ExtractionResult>>();
+
+function pruneExpiredCache(): void {
+  const now = Date.now();
+  for (const [k, v] of extractCache.entries()) {
+    if (v.expiresAt <= now) {
+      extractCache.delete(k);
+    }
+  }
+}
 
 export async function extractUrl(
   rawUrl: string,
@@ -22,70 +32,90 @@ export async function extractUrl(
     if (cached && cached.expiresAt > Date.now()) {
       return cached.data;
     }
-  }
-
-  const fetched = await fetchTargetPage(targetUrl);
-  let result: ExtractionResult;
-
-  if (fetched.html !== undefined) {
-    result = extractFromHtml(fetched.finalUrl, fetched.html);
-  } else {
-    const ct = fetched.contentType;
-    const urlStr = fetched.finalUrl.toString();
-    const filename = extractFilename(urlStr) || fetched.finalUrl.hostname;
-    result = {
-      adapter: 'direct-media',
-      metadata: {
-        title: filename,
-        siteName: fetched.finalUrl.hostname,
-        sourceUrl: urlStr,
-      },
-      videos: [],
-      images: [],
-      pdfs: [],
-      pages: [],
-    };
-
-    if (ct.includes('pdf')) {
-      result.pdfs.push({
-        id: makeMediaId(urlStr),
-        type: 'pdf',
-        url: urlStr,
-        title: filename,
-        mimeType: 'application/pdf',
-        sourceTag: 'direct',
-      });
-    } else if (ct.startsWith('video/')) {
-      result.videos.push({
-        id: makeMediaId(urlStr),
-        type: 'video',
-        url: urlStr,
-        title: filename,
-        mimeType: ct.split(';')[0],
-        sourceTag: 'direct',
-      });
-    } else if (ct.startsWith('image/')) {
-      result.images.push({
-        id: makeMediaId(urlStr),
-        type: 'image',
-        url: urlStr,
-        title: filename,
-        mimeType: ct.split(';')[0],
-        sourceTag: 'direct',
-      });
+    const existingFlight = inFlightExtractions.get(cacheKey);
+    if (existingFlight) {
+      return existingFlight;
     }
   }
 
-  if (extractCache.size >= MAX_CACHE_ENTRIES) {
-    const firstKey = extractCache.keys().next().value;
-    if (firstKey) extractCache.delete(firstKey);
-  }
-  extractCache.set(cacheKey, {
-    data: result,
-    expiresAt: Date.now() + CACHE_TTL_MS,
-  });
+  const run = (async (): Promise<ExtractionResult> => {
+    const fetched = await fetchTargetPage(targetUrl);
+    let result: ExtractionResult;
 
-  return result;
+    if (fetched.html !== undefined) {
+      result = extractFromHtml(fetched.finalUrl, fetched.html);
+    } else {
+      const ct = fetched.contentType;
+      const urlStr = fetched.finalUrl.toString();
+      const filename = extractFilename(urlStr) || fetched.finalUrl.hostname;
+      result = {
+        adapter: 'direct-media',
+        metadata: {
+          title: filename,
+          siteName: fetched.finalUrl.hostname,
+          sourceUrl: urlStr,
+        },
+        videos: [],
+        images: [],
+        pdfs: [],
+        pages: [],
+      };
+
+      if (ct.includes('pdf')) {
+        result.pdfs.push({
+          id: makeMediaId(urlStr),
+          type: 'pdf',
+          url: urlStr,
+          title: filename,
+          mimeType: 'application/pdf',
+          sourceTag: 'direct',
+        });
+      } else if (ct.startsWith('video/')) {
+        result.videos.push({
+          id: makeMediaId(urlStr),
+          type: 'video',
+          url: urlStr,
+          title: filename,
+          mimeType: ct.split(';')[0],
+          sourceTag: 'direct',
+        });
+      } else if (ct.startsWith('image/')) {
+        result.images.push({
+          id: makeMediaId(urlStr),
+          type: 'image',
+          url: urlStr,
+          title: filename,
+          mimeType: ct.split(';')[0],
+          sourceTag: 'direct',
+        });
+      }
+    }
+
+    if (extractCache.size >= MAX_CACHE_ENTRIES) {
+      pruneExpiredCache();
+      if (extractCache.size >= MAX_CACHE_ENTRIES) {
+        const firstKey = extractCache.keys().next().value;
+        if (firstKey) extractCache.delete(firstKey);
+      }
+    }
+    extractCache.set(cacheKey, {
+      data: result,
+      expiresAt: Date.now() + CACHE_TTL_MS,
+    });
+
+    return result;
+  })();
+
+  if (!bypassCache) {
+    inFlightExtractions.set(cacheKey, run);
+  }
+  try {
+    return await run;
+  } finally {
+    if (!bypassCache) {
+      inFlightExtractions.delete(cacheKey);
+    }
+  }
 }
 
 async function handleExtract(

@@ -53,19 +53,44 @@ export function unpackAllPackers(html: string): string[] {
   return results;
 }
 
-function extractDirectStreamFromText(text: string): { url: string; mimeType: string } | null {
+const RESOLVE_CACHE_TTL_MS = 2 * 60 * 1000;
+const RESOLVE_CACHE_MAX = 150;
+const resolveCache = new Map<string, { data: ResolvedVideo; expiresAt: number }>();
+const inFlightResolves = new Map<string, Promise<ResolvedVideo>>();
+
+export function extractDirectStreamFromText(text: string): { url: string; mimeType: string } | null {
+  // Unescape JSON-escaped forward slashes (https:\/\/cdn...\/master.m3u8)
+  const normalized = text.replace(/\\\//g, '/');
+
   // Mixdrop MDCore.wurl = "//..."
-  const mdCore = text.match(/MDCore\.wurl\s*=\s*["']((?:https?:)?\/\/[^"']+)["']/i);
+  const mdCore = normalized.match(/MDCore\.wurl\s*=\s*["']((?:https?:)?\/\/[^"']+)["']/i);
   if (mdCore?.[1]) {
     const url = mdCore[1].startsWith('//') ? `https:${mdCore[1]}` : mdCore[1];
     return { url, mimeType: 'video/mp4' };
   }
 
-  const m3u8 = text.match(/https?:\/\/[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*/i);
+  // Prefer explicit HLS sources (file/src/hls2/hls4/etc.)
+  const hlsKey = normalized.match(
+    /(?:file|src|source|hls\d?)\s*[:=]\s*["'](https?:\/\/[^"'\\s<>]+\.m3u8[^"'\\s<>]*)["']/i,
+  );
+  if (hlsKey?.[1]) {
+    return { url: hlsKey[1], mimeType: 'application/x-mpegURL' };
+  }
+
+  const m3u8 = normalized.match(/https?:\/\/[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*/i);
   if (m3u8?.[0]) {
     return { url: m3u8[0], mimeType: 'application/x-mpegURL' };
   }
-  const mp4 = text.match(/https?:\/\/[^\s"'<>\\]+\.mp4[^\s"'<>\\]*/i);
+
+  // YourUpload / generic og:video mp4
+  const ogVideo = normalized.match(
+    /<meta[^>]+property=["']og:video(?::secure_url)?["'][^>]+content=["'](https?:\/\/[^"']+\.mp4[^"']*)["']/i,
+  );
+  if (ogVideo?.[1]) {
+    return { url: ogVideo[1], mimeType: 'video/mp4' };
+  }
+
+  const mp4 = normalized.match(/https?:\/\/[^\s"'<>\\]+\.mp4[^\s"'<>\\]*/i);
   if (mp4?.[0] && !mp4[0].includes('Big_Buck_Bunny') && !mp4[0].includes('test-videos')) {
     return { url: mp4[0], mimeType: 'video/mp4' };
   }
@@ -73,11 +98,12 @@ function extractDirectStreamFromText(text: string): { url: string; mimeType: str
 }
 
 function extractSubtitlesFromText(text: string): SubtitleOption[] {
+  const normalized = text.replace(/\\\//g, '/');
   const subs: SubtitleOption[] = [];
   const seen = new Set<string>();
   const trackRegex = /\{[^}]*file\s*:\s*["'](https?:\/\/[^"']+\.(?:vtt|srt)[^"']*)["'][^}]*\}/gi;
   let match: RegExpExecArray | null;
-  while ((match = trackRegex.exec(text)) !== null) {
+  while ((match = trackRegex.exec(normalized)) !== null) {
     const block = match[0];
     const url = match[1];
     if (!url || seen.has(url) || /thumbnails/i.test(block)) continue;
@@ -149,6 +175,52 @@ export function decodeVoePayload(
 export async function resolveVideoStream(rawUrl: string, depth = 0): Promise<ResolvedVideo> {
   const target = validateTargetUrl(rawUrl);
   const urlStr = target.toString();
+
+  if (depth === 0) {
+    const cached = resolveCache.get(urlStr);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.data;
+    }
+    const existing = inFlightResolves.get(urlStr);
+    if (existing) {
+      return existing;
+    }
+  }
+
+  const promise = resolveVideoStreamUncached(target, depth).then((res) => {
+    if (depth === 0 && !res.isEmbed && !res.unavailableReason) {
+      if (resolveCache.size >= RESOLVE_CACHE_MAX) {
+        const now = Date.now();
+        for (const [k, v] of resolveCache.entries()) {
+          if (v.expiresAt <= now) resolveCache.delete(k);
+        }
+        if (resolveCache.size >= RESOLVE_CACHE_MAX) {
+          const firstKey = resolveCache.keys().next().value;
+          if (firstKey) resolveCache.delete(firstKey);
+        }
+      }
+      resolveCache.set(urlStr, {
+        data: res,
+        expiresAt: Date.now() + RESOLVE_CACHE_TTL_MS,
+      });
+    }
+    return res;
+  });
+
+  if (depth === 0) {
+    inFlightResolves.set(urlStr, promise);
+  }
+  try {
+    return await promise;
+  } finally {
+    if (depth === 0) {
+      inFlightResolves.delete(urlStr);
+    }
+  }
+}
+
+async function resolveVideoStreamUncached(target: URL, depth = 0): Promise<ResolvedVideo> {
+  const urlStr = target.toString();
   const host = target.hostname.toLowerCase();
 
   // Direct HLS stream (e.g. player.zilla-networks.com/m3u8/...)
@@ -183,7 +255,9 @@ export async function resolveVideoStream(rawUrl: string, depth = 0): Promise<Res
 
     if (res.ok) {
       const html = await res.text();
-      const match = html.match(/window\.location\.href\s*=\s*['"](https?:\/\/[^'"]+)['"]/i);
+      const match = html.match(
+        /window\.location(?:\.href\s*=|\.replace\()\s*['"](https?:\/\/[^'"]+)['"]/i,
+      );
       if (match?.[1]) {
         return resolveVideoStream(match[1], depth + 1);
       }
@@ -226,7 +300,7 @@ export async function resolveVideoStream(rawUrl: string, depth = 0): Promise<Res
       });
       if (res.ok) {
         const html = await res.text();
-        if (/file was deleted|video not found/i.test(html)) {
+        if (/file was deleted|video not found|file is no longer available/i.test(html)) {
           return {
             streamUrl: urlStr,
             isEmbed: true,
@@ -236,9 +310,9 @@ export async function resolveVideoStream(rawUrl: string, depth = 0): Promise<Res
         }
 
         // Follow single JS redirect (e.g. voe.sx -> mirror domain)
-        if (depth < 2 && html.length < 4000) {
+        if (depth < 2 && html.length < 5000) {
           const jsRedirect = html.match(
-            /window\.location\.href\s*=\s*['"](https?:\/\/[^'"]+)['"]/i,
+            /window\.location(?:\.href\s*=|\.replace\()\s*['"](https?:\/\/[^'"]+)['"]/i,
           );
           if (jsRedirect?.[1] && jsRedirect[1] !== urlStr) {
             return resolveVideoStream(jsRedirect[1], depth + 1);
@@ -262,7 +336,10 @@ export async function resolveVideoStream(rawUrl: string, depth = 0): Promise<Res
           extractDirectStreamFromText(html);
 
         if (found) {
-          const subtitles = unpacked ? extractSubtitlesFromText(unpacked) : [];
+          const subtitles = [
+            ...(unpacked ? extractSubtitlesFromText(unpacked) : []),
+            ...extractSubtitlesFromText(html),
+          ].filter((s, idx, arr) => arr.findIndex((x) => x.url === s.url) === idx);
           return {
             streamUrl: found.url,
             referer: `${target.origin}/`,

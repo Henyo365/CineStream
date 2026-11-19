@@ -15,6 +15,12 @@ const ACCESS_PIN = process.env.ACCESS_PIN?.trim() || '';
 
 const app = express();
 app.set('trust proxy', 1);
+app.disable('x-powered-by');
+app.use((_req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  next();
+});
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 
@@ -36,9 +42,14 @@ function requireAccessPin(req: Request, res: Response, next: NextFunction): void
 app.get('/health', (_req, res) => {
   res.json({
     ok: true,
+    version: '1.1.0',
     requiresPin: Boolean(ACCESS_PIN),
     adapters: listAdapters(),
   });
+});
+
+app.get('/api/ping', requireAccessPin, (_req, res) => {
+  res.json({ ok: true });
 });
 
 app.use('/api/extract', requireAccessPin, extractRouter);

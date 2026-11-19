@@ -70,12 +70,18 @@ function formatTime(sec: number): string {
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 }
 
-function buildHlsPlayerHtml(streamUrl: string, subtitles?: SubtitleOption[], proxyOrigin?: string): string {
+function buildHlsPlayerHtml(
+  streamUrl: string,
+  subtitles?: SubtitleOption[],
+  proxyOrigin?: string,
+  referer?: string,
+  pin?: string,
+): string {
   const safeUrl = JSON.stringify(streamUrl);
   const safeSubs = JSON.stringify(
     (subtitles ?? []).map((s) => ({
       label: s.label,
-      url: proxyOrigin ? `${proxyOrigin}/api/proxy?url=${encodeURIComponent(s.url)}` : s.url,
+      url: proxyOrigin ? buildProxyUrl(proxyOrigin, s.url, referer, pin) : s.url,
     })),
   );
   return `<!DOCTYPE html>
@@ -299,6 +305,9 @@ function CustomNativePlayer({
 }) {
   const videoRef = useRef<VideoView>(null);
   const [controlsVisible, setControlsVisible] = useState(true);
+  const [isLocked, setIsLocked] = useState(false);
+  const [seekFeedback, setSeekFeedback] = useState<{ label: string; side: 'left' | 'right' } | null>(null);
+  const [playerWidth, setPlayerWidth] = useState(360);
   const [speedIdx, setSpeedIdx] = useState(0);
   const [contentFit, setContentFit] = useState<VideoContentFit>('contain');
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -323,6 +332,12 @@ function CustomNativePlayer({
   const watchedMarkedRef = useRef(false);
   const autoPickedAudioRef = useRef(false);
   const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const seekFeedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastTapRef = useRef<{ time: number; side: 'left' | 'right' | 'center' }>({
+    time: 0,
+    side: 'center',
+  });
+  const latestPosRef = useRef({ currentTime: 0, duration: 0 });
 
   const resetHideTimer = () => {
     if (hideTimerRef.current) {
@@ -370,8 +385,13 @@ function CustomNativePlayer({
   });
 
   const currentTime = timeUpdate.currentTime ?? 0;
+  const bufferedPosition = timeUpdate.bufferedPosition ?? 0;
   const duration = player.duration ?? 0;
   const progressRatio = duration > 0 ? Math.min(1, Math.max(0, currentTime / duration)) : 0;
+  const bufferedRatio =
+    duration > 0 ? Math.min(1, Math.max(progressRatio, bufferedPosition / duration)) : 0;
+
+  latestPosRef.current = { currentTime, duration };
 
   const audioTracksEvt = useEvent(player, 'availableAudioTracksChange', {
     availableAudioTracks: player.availableAudioTracks ?? [],
@@ -431,6 +451,17 @@ function CustomNativePlayer({
   }, [status, episodeKey, player]);
 
   useEventListener(player, 'playToEnd', () => {
+    const dur = player.duration || latestPosRef.current.duration;
+    if (episodeKey && dur > 0) {
+      void savePlaybackProgress(episodeKey, dur, dur, {
+        title: progressTitle || title,
+        thumbnail: posterThumbnail,
+      });
+      if (!watchedMarkedRef.current) {
+        watchedMarkedRef.current = true;
+        onWatched?.(episodeKey);
+      }
+    }
     if (hasNext) {
       setNextCountdown(5);
     }
@@ -462,6 +493,22 @@ function CustomNativePlayer({
     }
   }, [currentTime, duration, episodeKey, progressTitle, title, posterThumbnail, onWatched]);
 
+  // Save final position immediately on unmount
+  useEffect(() => {
+    return () => {
+      const { currentTime: pos, duration: dur } = latestPosRef.current;
+      if (episodeKey && dur > 0 && pos > 2) {
+        void savePlaybackProgress(episodeKey, pos, dur, {
+          title: progressTitle || title,
+          thumbnail: posterThumbnail,
+        });
+      }
+      if (seekFeedbackTimerRef.current) {
+        clearTimeout(seekFeedbackTimerRef.current);
+      }
+    };
+  }, [episodeKey, progressTitle, title, posterThumbnail]);
+
   // Load external VTT cues when selected
   useEffect(() => {
     if (!selectedExtSubUrl) {
@@ -481,7 +528,7 @@ function CustomNativePlayer({
     return () => {
       cancelled = true;
     };
-  }, [selectedExtSubUrl, backendUrl, referer]);
+  }, [selectedExtSubUrl, backendUrl, referer, accessPin]);
 
   useEffect(() => {
     if (controlsVisible && isPlaying && !tracksModalOpen) {
@@ -510,13 +557,44 @@ function CustomNativePlayer({
   const handleTogglePlay = () => {
     if (isPlaying) {
       player.pause();
+      if (episodeKey && duration > 0 && currentTime > 2) {
+        void savePlaybackProgress(episodeKey, currentTime, duration, {
+          title: progressTitle || title,
+          thumbnail: posterThumbnail,
+        });
+      }
     } else {
       player.play();
     }
   };
 
+  const triggerSeekFeedback = (label: string, side: 'left' | 'right') => {
+    setSeekFeedback({ label, side });
+    if (seekFeedbackTimerRef.current) clearTimeout(seekFeedbackTimerRef.current);
+    seekFeedbackTimerRef.current = setTimeout(() => setSeekFeedback(null), 650);
+  };
+
   const handleSeekBy = (delta: number) => {
     player.seekBy(delta);
+    triggerSeekFeedback(delta > 0 ? `+${delta}s` : `${delta}s`, delta > 0 ? 'right' : 'left');
+  };
+
+  const handleSurfacePress = (evt: { nativeEvent: { locationX: number } }) => {
+    if (isLocked) {
+      setControlsVisible((v) => !v);
+      return;
+    }
+    const x = evt.nativeEvent.locationX;
+    const side: 'left' | 'right' | 'center' =
+      x < playerWidth * 0.35 ? 'left' : x > playerWidth * 0.65 ? 'right' : 'center';
+    const now = Date.now();
+    if (side !== 'center' && lastTapRef.current.side === side && now - lastTapRef.current.time < 300) {
+      lastTapRef.current = { time: 0, side: 'center' };
+      handleSeekBy(side === 'left' ? -10 : 10);
+      return;
+    }
+    lastTapRef.current = { time: now, side };
+    setControlsVisible((v) => !v);
   };
 
   const handleCycleSpeed = () => {
@@ -607,7 +685,10 @@ function CustomNativePlayer({
     Boolean(externalSubtitles && externalSubtitles.length > 0);
 
   return (
-    <View style={styles.videoWrapper}>
+    <View
+      style={styles.videoWrapper}
+      onLayout={(e) => setPlayerWidth(e.nativeEvent.layout.width || 360)}
+    >
       <StatusBar hidden={isFullscreen} />
       <VideoView
         ref={videoRef}
@@ -620,11 +701,26 @@ function CustomNativePlayer({
         allowsPictureInPicture
       />
 
-      {/* Tap layer above VideoView so Android/iOS always receives tap-to-toggle */}
-      <Pressable
-        style={StyleSheet.absoluteFill}
-        onPress={() => setControlsVisible((v) => !v)}
-      />
+      {/* Tap layer above VideoView so Android/iOS always receives tap-to-toggle & double-tap seek */}
+      <Pressable style={StyleSheet.absoluteFill} onPress={handleSurfacePress} />
+
+      {/* Double-tap seek feedback badge */}
+      {seekFeedback && (
+        <View
+          style={[
+            styles.seekFeedbackPill,
+            seekFeedback.side === 'left' ? styles.seekFeedbackLeft : styles.seekFeedbackRight,
+          ]}
+          pointerEvents="none"
+        >
+          <Ionicons
+            name={seekFeedback.side === 'left' ? 'play-back' : 'play-forward'}
+            size={18}
+            color="#ffffff"
+          />
+          <Text style={styles.seekFeedbackText}>{seekFeedback.label}</Text>
+        </View>
+      )}
 
       {/* External VTT subtitle overlay */}
       {activeCueText ? (
@@ -671,7 +767,22 @@ function CustomNativePlayer({
         </View>
       )}
 
-      {controlsVisible && status !== 'error' && (
+      {controlsVisible && isLocked && status !== 'error' && (
+        <View style={styles.lockedOverlay} pointerEvents="box-none">
+          <TouchableOpacity
+            style={styles.unlockBtn}
+            onPress={() => {
+              setIsLocked(false);
+              setControlsVisible(true);
+            }}
+          >
+            <Ionicons name="lock-closed" size={20} color="#ffffff" />
+            <Text style={styles.playerPillText}>Desbloquear pantalla</Text>
+          </TouchableOpacity>
+        </View>
+      )}
+
+      {controlsVisible && !isLocked && status !== 'error' && (
         <View style={styles.playerOverlay} pointerEvents="box-none">
           {/* Top bar */}
           <View style={styles.playerTopBar}>
@@ -681,6 +792,15 @@ function CustomNativePlayer({
             <Text style={styles.playerTitle} numberOfLines={1}>
               {title}
             </Text>
+            <TouchableOpacity
+              onPress={() => {
+                setIsLocked(true);
+                setControlsVisible(false);
+              }}
+              style={styles.playerIconBtn}
+            >
+              <Ionicons name="lock-open-outline" size={19} color="#ffffff" />
+            </TouchableOpacity>
             <TouchableOpacity
               onPress={() => {
                 setTracksTab('audio');
@@ -761,6 +881,7 @@ function CustomNativePlayer({
                 onLayout={handleBarLayout}
                 onPress={handleSeekBarPress}
               >
+                <View style={[styles.seekBuffered, { width: `${bufferedRatio * 100}%` }]} />
                 <View style={[styles.seekFill, { width: `${progressRatio * 100}%` }]} />
               </Pressable>
               <Text style={styles.timeText}>{formatTime(duration)}</Text>
@@ -768,6 +889,10 @@ function CustomNativePlayer({
 
             <View style={styles.bottomActionsRow}>
               <View style={styles.epNavRow}>
+                <TouchableOpacity onPress={() => handleSeekBy(85)} style={styles.playerPillBtn}>
+                  <Ionicons name="play-forward-outline" size={14} color="#e0e7ff" />
+                  <Text style={styles.playerPillText}>+85s Intro</Text>
+                </TouchableOpacity>
                 {hasPrev && (
                   <TouchableOpacity onPress={onPrev} style={styles.playerPillBtn}>
                     <Ionicons name="play-skip-back" size={14} color="#e0e7ff" />
@@ -1191,7 +1316,15 @@ export function MediaViewerModal({
         if (Platform.OS === 'web') {
           const webIframeProps =
             isHls && (!resolvedEmbed || forceWebView)
-              ? { srcDoc: buildHlsPlayerHtml(proxiedUrl, resolvedSubtitles, backendUrl) }
+              ? {
+                  srcDoc: buildHlsPlayerHtml(
+                    proxiedUrl,
+                    resolvedSubtitles,
+                    backendUrl,
+                    activeReferer,
+                    accessPin,
+                  ),
+                }
               : { src: activeUrl };
           return (
             <View style={styles.webview}>
@@ -1207,7 +1340,16 @@ export function MediaViewerModal({
 
         const source =
           forceWebView && isHls
-            ? { html: buildHlsPlayerHtml(proxiedUrl, resolvedSubtitles, backendUrl), baseUrl: backendUrl }
+            ? {
+                html: buildHlsPlayerHtml(
+                  proxiedUrl,
+                  resolvedSubtitles,
+                  backendUrl,
+                  activeReferer,
+                  accessPin,
+                ),
+                baseUrl: backendUrl,
+              }
             : {
                 uri: activeUrl,
                 headers: activeReferer ? { Referer: activeReferer } : undefined,
@@ -1268,6 +1410,7 @@ export function MediaViewerModal({
             uri={proxiedUrl}
             isHls={isHls}
             backendUrl={backendUrl}
+            accessPin={accessPin}
             referer={activeReferer}
             episodeKey={referer}
             title={episodeTitle || item.title || 'Reproductor'}
@@ -1608,16 +1751,67 @@ const styles = StyleSheet.create({
   },
   seekTrack: {
     flex: 1,
-    height: 18,
+    height: 12,
     justifyContent: 'center',
-    backgroundColor: 'rgba(255,255,255,0.22)',
-    borderRadius: 9,
+    backgroundColor: 'rgba(255,255,255,0.2)',
+    borderRadius: 6,
     overflow: 'hidden',
+    position: 'relative',
+  },
+  seekBuffered: {
+    position: 'absolute',
+    left: 0,
+    top: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(255,255,255,0.32)',
+    borderRadius: 6,
   },
   seekFill: {
     height: '100%',
     backgroundColor: '#818cf8',
-    borderRadius: 9,
+    borderRadius: 6,
+  },
+  seekFeedbackPill: {
+    position: 'absolute',
+    top: '45%',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: 'rgba(15, 23, 42, 0.85)',
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 24,
+    borderWidth: 1,
+    borderColor: 'rgba(129, 140, 248, 0.5)',
+    zIndex: 20,
+  },
+  seekFeedbackLeft: {
+    left: '14%',
+  },
+  seekFeedbackRight: {
+    right: '14%',
+  },
+  seekFeedbackText: {
+    color: '#ffffff',
+    fontSize: 15,
+    fontWeight: '700',
+  },
+  lockedOverlay: {
+    ...StyleSheet.absoluteFill,
+    justifyContent: 'flex-start',
+    alignItems: 'flex-end',
+    padding: 20,
+  },
+  unlockBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: 'rgba(15, 23, 42, 0.85)',
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: 'rgba(129, 140, 248, 0.5)',
   },
   bottomActionsRow: {
     flexDirection: 'row',
