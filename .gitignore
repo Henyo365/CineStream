@@ -1,6 +1,7 @@
 node_modules/
 dist/
 backend/public/
+rust-engine/target/
 .expo/
 .DS_Store
 *.log

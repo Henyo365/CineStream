@@ -53,6 +53,7 @@ export function buildProxyUrl(
 
 export interface BackendHealthResult {
   ok: boolean;
+  engine?: string;
   requiresPin?: boolean;
   pinValid?: boolean;
   latencyMs?: number;
@@ -77,6 +78,7 @@ export async function checkBackendHealth(
     }
     const data = await parseJsonSafe<{
       ok?: boolean;
+      engine?: string;
       requiresPin?: boolean;
       version?: string;
     }>(res);
@@ -94,6 +96,7 @@ export async function checkBackendHealth(
       );
       return {
         ok: true,
+        engine: data.engine,
         requiresPin: true,
         pinValid: pingRes.ok,
         latencyMs,
@@ -104,6 +107,7 @@ export async function checkBackendHealth(
 
     return {
       ok: true,
+      engine: data.engine,
       requiresPin: false,
       pinValid: true,
       latencyMs,
@@ -144,13 +148,17 @@ export async function globalSearchMedia(
   backendUrl: string,
   query: string,
   pin?: string,
+  source: 'all' | 'animeflv' | 'hackstore' = 'all',
 ): Promise<ExtractionResult> {
   const base = normalizeBackendUrl(backendUrl);
   const headers: Record<string, string> = {};
   if (pin) headers['x-access-pin'] = pin;
 
+  const params = new URLSearchParams({ q: query.trim() });
+  if (source !== 'all') params.set('source', source);
+
   const res = await fetchWithTimeout(
-    `${base}/api/search?q=${encodeURIComponent(query.trim())}`,
+    `${base}/api/search?${params.toString()}`,
     {
       method: 'GET',
       headers,
@@ -202,5 +210,33 @@ export async function resolveVideoUrl(
     return data ?? { streamUrl: targetUrl, isEmbed: true };
   } catch {
     return { streamUrl: targetUrl, isEmbed: true };
+  }
+}
+
+export async function resolveVideoBatch(
+  backendUrl: string,
+  urls: string[],
+  pin?: string,
+): Promise<Record<string, ResolvedVideoResponse>> {
+  if (urls.length === 0) return {};
+  const base = normalizeBackendUrl(backendUrl);
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (pin) headers['x-access-pin'] = pin;
+
+  try {
+    const res = await fetchWithTimeout(
+      `${base}/api/resolve-batch`,
+      {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ urls: urls.slice(0, 6) }),
+      },
+      12_000,
+    );
+    if (!res.ok) return {};
+    const data = await parseJsonSafe<{ results?: Record<string, ResolvedVideoResponse> }>(res);
+    return data?.results ?? {};
+  } catch {
+    return {};
   }
 }

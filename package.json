@@ -1,16 +1,17 @@
 {
   "name": "cinestream",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "engines": {
     "node": ">=22"
   },
   "scripts": {
-    "build": "pnpm --filter youanime-backend run build && EXPO_NO_TELEMETRY=1 pnpm --filter youanime-mobile exec expo export --platform web --output-dir ../backend/public",
-    "start": "pnpm --filter youanime-backend start",
-    "dev:backend": "pnpm --filter youanime-backend dev",
+    "build": "cargo build --release --manifest-path rust-engine/Cargo.toml && EXPO_NO_TELEMETRY=1 pnpm --filter youanime-mobile exec expo export --platform web --output-dir ../backend/public",
+    "start": "cargo run --release --manifest-path rust-engine/Cargo.toml",
+    "dev:backend": "cargo run --manifest-path rust-engine/Cargo.toml",
+    "dev:backend-node": "pnpm --filter youanime-backend dev",
     "dev:mobile": "pnpm --filter youanime-mobile start",
     "dev:web": "pnpm --filter youanime-mobile web",
-    "test": "pnpm --filter youanime-backend test"
+    "test": "cargo test --manifest-path rust-engine/Cargo.toml && pnpm --filter youanime-backend build && pnpm --filter youanime-backend test"
   }
 }

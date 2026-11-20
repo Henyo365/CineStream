@@ -183,7 +183,7 @@ export function SettingsModal({
                 ]}
               >
                 {health.ok && health.pinValid !== false
-                  ? `Conectado${health.latencyMs ? ` (${health.latencyMs} ms)` : ''}${health.requiresPin ? ' • PIN válido' : ''}`
+                  ? `Conectado${health.engine === 'rust' ? ' • ⚡ Motor Rust' : ''}${health.version ? ` v${health.version}` : ''}${health.latencyMs ? ` (${health.latencyMs} ms)` : ''}${health.requiresPin ? ' • PIN válido' : ''}`
                   : health.error || 'No se pudo conectar con el servidor.'}
               </Text>
             </View>

@@ -8,17 +8,7 @@ export interface FetchedPage {
 }
 
 export async function fetchTargetPage(targetUrl: URL): Promise<FetchedPage> {
-  let effectiveUrl = targetUrl;
-  if (
-    effectiveUrl.hostname.toLowerCase().includes('lectortmo.vip') &&
-    effectiveUrl.pathname === '/' &&
-    effectiveUrl.searchParams.has('s')
-  ) {
-    const q = effectiveUrl.searchParams.get('s') ?? '';
-    effectiveUrl = new URL(`https://lectortmo.vip/manga/?s=${encodeURIComponent(q)}`);
-  }
-
-  const response = await fetch(effectiveUrl.toString(), {
+  const response = await fetch(targetUrl.toString(), {
     headers: {
       'User-Agent': DEFAULT_USER_AGENT,
       Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',

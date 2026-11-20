@@ -10,6 +10,7 @@ const WATCHED_KEY = '@youanime/watched';
 const PROGRESS_KEY = '@youanime/progress';
 const CUSTOM_SOURCES_KEY = '@youanime/custom_sources';
 const ACCESS_PIN_KEY = '@youanime/access_pin';
+const RECENT_SEARCHES_KEY = '@youanime/recent_searches';
 
 function resolveDefaultBackendUrl(): string {
   if (Platform.OS === 'web') {
@@ -190,4 +191,30 @@ export async function loadCustomSources(): Promise<FixedSource[]> {
 
 export async function saveCustomSources(sources: FixedSource[]): Promise<void> {
   await AsyncStorage.setItem(CUSTOM_SOURCES_KEY, JSON.stringify(sources));
+}
+
+export async function loadRecentSearches(): Promise<string[]> {
+  const raw = await AsyncStorage.getItem(RECENT_SEARCHES_KEY);
+  if (!raw) return [];
+  try {
+    return JSON.parse(raw) as string[];
+  } catch {
+    return [];
+  }
+}
+
+export async function addRecentSearch(query: string): Promise<string[]> {
+  const clean = query.trim();
+  if (!clean || /^https?:\/\//i.test(clean)) return loadRecentSearches();
+  const current = await loadRecentSearches();
+  const next = [
+    clean,
+    ...current.filter((item) => item.toLowerCase() !== clean.toLowerCase()),
+  ].slice(0, 10);
+  await AsyncStorage.setItem(RECENT_SEARCHES_KEY, JSON.stringify(next));
+  return next;
+}
+
+export async function clearRecentSearches(): Promise<void> {
+  await AsyncStorage.removeItem(RECENT_SEARCHES_KEY);
 }

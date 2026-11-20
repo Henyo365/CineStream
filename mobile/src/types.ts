@@ -11,14 +11,24 @@ export interface MediaItem {
   sourceTag?: string;
 }
 
+export interface GenreTag {
+  label: string;
+  url?: string;
+}
+
 export interface PageMetadata {
   title: string;
   description?: string;
   siteName?: string;
   favicon?: string;
   poster?: string;
+  backdrop?: string;
   infoUrl?: string;
   status?: string;
+  rating?: string;
+  year?: string;
+  duration?: string;
+  genres?: GenreTag[];
   sourceUrl: string;
 }
 
@@ -29,6 +39,8 @@ export interface PageLink {
   subtitle?: string;
   thumbnail?: string;
   group?: string;
+  source?: string;
+  score?: number;
 }
 
 export interface ExtractionResult {
@@ -38,6 +50,7 @@ export interface ExtractionResult {
   images: MediaItem[];
   pdfs: MediaItem[];
   pages?: PageLink[];
+  related?: PageLink[];
   nextPageUrl?: string;
 }
 

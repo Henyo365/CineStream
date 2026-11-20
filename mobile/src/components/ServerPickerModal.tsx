@@ -9,13 +9,16 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
+import type { ResolvedVideoResponse } from '../services/api';
 import type { MediaItem } from '../types';
 
 interface ServerPickerModalProps {
   visible: boolean;
   title?: string;
   loading: boolean;
+  probing?: boolean;
   videos: MediaItem[];
+  probeMap?: Record<string, ResolvedVideoResponse>;
   onSelect: (item: MediaItem) => void;
   onRetry?: () => void;
   onClose: () => void;
@@ -25,18 +28,31 @@ export function ServerPickerModal({
   visible,
   title,
   loading,
+  probing = false,
   videos,
+  probeMap = {},
   onSelect,
   onRetry,
   onClose,
 }: ServerPickerModalProps) {
   const orderedVideos = useMemo(() => {
-    return [...videos].sort((a, b) => {
-      const aDirect = !a.isEmbed ? 1 : 0;
-      const bDirect = !b.isEmbed ? 1 : 0;
-      return bDirect - aDirect;
+    const rank = (v: MediaItem): number => {
+      const p = probeMap[v.url];
+      if (p?.unavailableReason) return 0; // dead at bottom
+      if (p && !p.isEmbed) return 3; // verified native HD at top!
+      if (!v.isEmbed) return 2; // statically detected direct stream
+      return 1; // web/embed fallback
+    };
+    return [...videos].sort((a, b) => rank(b) - rank(a));
+  }, [videos, probeMap]);
+
+  const bestNativeVideo = useMemo(() => {
+    return orderedVideos.find((v) => {
+      const p = probeMap[v.url];
+      if (p?.unavailableReason) return false;
+      return (p && !p.isEmbed) || !v.isEmbed;
     });
-  }, [videos]);
+  }, [orderedVideos, probeMap]);
 
   return (
     <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
@@ -51,15 +67,36 @@ export function ServerPickerModal({
                 {title || 'Elegir servidor'}
               </Text>
               {!loading && videos.length > 0 && (
-                <Text style={styles.headerSub}>
-                  {videos.length} {videos.length === 1 ? 'servidor disponible' : 'servidores disponibles'}
-                </Text>
+                <View style={styles.subRow}>
+                  <Text style={styles.headerSub}>
+                    {videos.length} {videos.length === 1 ? 'servidor' : 'servidores'}
+                  </Text>
+                  {probing && (
+                    <View style={styles.probeBadge}>
+                      <ActivityIndicator size="small" color="#818cf8" style={{ transform: [{ scale: 0.7 }] }} />
+                      <Text style={styles.probeText}>Verificando HD...</Text>
+                    </View>
+                  )}
+                </View>
               )}
             </View>
             <TouchableOpacity onPress={onClose} style={styles.closeBtn}>
               <Ionicons name="close" size={20} color="#94a3b8" />
             </TouchableOpacity>
           </View>
+
+          {!loading && bestNativeVideo && (
+            <TouchableOpacity
+              style={styles.quickPlayBtn}
+              onPress={() => onSelect(bestNativeVideo)}
+              activeOpacity={0.85}
+            >
+              <Ionicons name="flash" size={18} color="#ffffff" />
+              <Text style={styles.quickPlayText} numberOfLines={1}>
+                Reproducir mejor servidor HD
+              </Text>
+            </TouchableOpacity>
+          )}
 
           {loading ? (
             <View style={styles.loadingBox}>
@@ -80,31 +117,63 @@ export function ServerPickerModal({
           ) : (
             <ScrollView style={styles.list} contentContainerStyle={styles.listContent}>
               {orderedVideos.map((video, idx) => {
-                const isDirect = !video.isEmbed;
-                const cleanTitle = (video.title || `Opción ${idx + 1}`).replace(/\s*★\s*Nativo/i, '');
+                const probe = probeMap[video.url];
+                const isDead = Boolean(probe?.unavailableReason);
+                const isNative = !isDead && ((probe && !probe.isEmbed) || !video.isEmbed);
+                const hasSubs = Boolean(probe?.subtitles && probe.subtitles.length > 0);
+                const cleanTitle = (video.title || `Opción ${idx + 1}`).replace(
+                  /\s*★\s*Nativo/i,
+                  '',
+                );
+
                 return (
                   <TouchableOpacity
                     key={video.id}
-                    style={[styles.serverRow, isDirect && styles.serverRowDirect]}
+                    style={[
+                      styles.serverRow,
+                      isNative && styles.serverRowDirect,
+                      isDead && styles.serverRowDead,
+                    ]}
                     onPress={() => onSelect(video)}
                     activeOpacity={0.75}
                   >
                     <Ionicons
-                      name={isDirect ? 'flash' : 'play-outline'}
+                      name={isDead ? 'close-circle-outline' : isNative ? 'flash' : 'play-outline'}
                       size={20}
-                      color={isDirect ? '#4ade80' : '#cbd5e1'}
+                      color={isDead ? '#f87171' : isNative ? '#4ade80' : '#cbd5e1'}
                     />
-                    <Text style={styles.serverName} numberOfLines={1}>
-                      {cleanTitle}
-                    </Text>
-                    <View style={[styles.badge, isDirect ? styles.badgeDirect : styles.badgeEmbed]}>
+                    <View style={styles.serverInfoCol}>
+                      <Text
+                        style={[styles.serverName, isDead && styles.serverNameDead]}
+                        numberOfLines={1}
+                      >
+                        {cleanTitle}
+                      </Text>
+                      {hasSubs && (
+                        <Text style={styles.subsHint}>Incluye subtítulos CC</Text>
+                      )}
+                    </View>
+                    <View
+                      style={[
+                        styles.badge,
+                        isDead
+                          ? styles.badgeDead
+                          : isNative
+                            ? styles.badgeDirect
+                            : styles.badgeEmbed,
+                      ]}
+                    >
                       <Text
                         style={[
                           styles.badgeText,
-                          isDirect ? styles.badgeTextDirect : styles.badgeTextEmbed,
+                          isDead
+                            ? styles.badgeTextDead
+                            : isNative
+                              ? styles.badgeTextDirect
+                              : styles.badgeTextEmbed,
                         ]}
                       >
-                        {isDirect ? 'Nativo' : 'Auto'}
+                        {isDead ? 'Caído' : isNative ? 'HD Nativo' : 'Web'}
                       </Text>
                     </View>
                   </TouchableOpacity>
@@ -134,8 +203,8 @@ const styles = StyleSheet.create({
   },
   dialog: {
     width: '100%',
-    maxWidth: 380,
-    maxHeight: '78%',
+    maxWidth: 390,
+    maxHeight: '80%',
     backgroundColor: '#1d202b',
     borderRadius: 20,
     paddingTop: 16,
@@ -169,13 +238,44 @@ const styles = StyleSheet.create({
     fontSize: 15,
     fontWeight: '700',
   },
+  subRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginTop: 2,
+  },
   headerSub: {
     color: '#94a3b8',
     fontSize: 11.5,
-    marginTop: 1,
+  },
+  probeBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 3,
+  },
+  probeText: {
+    color: '#818cf8',
+    fontSize: 11,
+    fontWeight: '600',
   },
   closeBtn: {
     padding: 4,
+  },
+  quickPlayBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    backgroundColor: '#4f46e5',
+    paddingVertical: 11,
+    paddingHorizontal: 14,
+    borderRadius: 12,
+    marginBottom: 10,
+  },
+  quickPlayText: {
+    color: '#ffffff',
+    fontSize: 13.5,
+    fontWeight: '700',
   },
   loadingBox: {
     alignItems: 'center',
@@ -203,7 +303,7 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
   list: {
-    maxHeight: 350,
+    maxHeight: 330,
   },
   listContent: {
     gap: 6,
@@ -222,11 +322,26 @@ const styles = StyleSheet.create({
     borderColor: 'rgba(74, 222, 128, 0.35)',
     backgroundColor: 'rgba(74, 222, 128, 0.08)',
   },
-  serverName: {
+  serverRowDead: {
+    opacity: 0.5,
+    backgroundColor: 'rgba(239, 68, 68, 0.08)',
+  },
+  serverInfoCol: {
     flex: 1,
+  },
+  serverName: {
     color: '#f1f5f9',
     fontSize: 14,
     fontWeight: '600',
+  },
+  serverNameDead: {
+    color: '#94a3b8',
+    textDecorationLine: 'line-through',
+  },
+  subsHint: {
+    color: '#a5b4fc',
+    fontSize: 11,
+    marginTop: 2,
   },
   badge: {
     paddingHorizontal: 8,
@@ -239,6 +354,9 @@ const styles = StyleSheet.create({
   badgeEmbed: {
     backgroundColor: 'rgba(148, 163, 184, 0.16)',
   },
+  badgeDead: {
+    backgroundColor: 'rgba(239, 68, 68, 0.2)',
+  },
   badgeText: {
     fontSize: 11,
     fontWeight: '700',
@@ -248,6 +366,9 @@ const styles = StyleSheet.create({
   },
   badgeTextEmbed: {
     color: '#94a3b8',
+  },
+  badgeTextDead: {
+    color: '#fca5a5',
   },
   footer: {
     flexDirection: 'row',

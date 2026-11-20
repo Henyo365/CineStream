@@ -81,7 +81,6 @@ app.get('/api/search', requireAccessPin, async (req, res) => {
   const sources = [
     { name: 'AnimeFLV', url: `https://animeflv.or.at/?s=${encoded}` },
     { name: 'Hackstore', url: `https://www.hackstore.fo/?s=${encoded}` },
-    { name: 'LectorTMO', url: `https://lectortmo.vip/manga/?s=${encoded}` },
   ];
 
   const settled = await Promise.allSettled(
