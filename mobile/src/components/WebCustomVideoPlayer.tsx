@@ -3,7 +3,6 @@ import Hls from 'hls.js';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
-  type LayoutChangeEvent,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -101,7 +100,10 @@ export function WebCustomVideoPlayer({
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [volume, setVolume] = useState(1);
   const [isMuted, setIsMuted] = useState(false);
-  const [barWidth, setBarWidth] = useState(1);
+  const [scrubRatio, setScrubRatio] = useState<number | null>(null);
+  const scrubRatioRef = useRef<number | null>(null);
+  const isDraggingRef = useRef(false);
+  const seekDivRef = useRef<HTMLDivElement | null>(null);
 
   const [tracksModalOpen, setTracksModalOpen] = useState(false);
   const [tracksTab, setTracksTab] = useState<'audio' | 'sub' | 'quality'>('audio');
@@ -129,7 +131,7 @@ export function WebCustomVideoPlayer({
   metaRef.current = { title, posterThumbnail };
 
   useEffect(() => {
-    if (controlsVisible && isPlaying && !tracksModalOpen) {
+    if (controlsVisible && isPlaying && !tracksModalOpen && scrubRatio === null) {
       if (hideTimerRef.current) clearTimeout(hideTimerRef.current);
       hideTimerRef.current = setTimeout(() => setControlsVisible(false), 3500);
     } else if (hideTimerRef.current) {
@@ -139,7 +141,7 @@ export function WebCustomVideoPlayer({
     return () => {
       if (hideTimerRef.current) clearTimeout(hideTimerRef.current);
     };
-  }, [controlsVisible, isPlaying, tracksModalOpen]);
+  }, [controlsVisible, isPlaying, tracksModalOpen, scrubRatio]);
 
   useEffect(() => {
     const video = videoElRef.current;
@@ -460,16 +462,64 @@ export function WebCustomVideoPlayer({
     }
   };
 
-  const handleSeekBarPress = (evt: { nativeEvent: { locationX: number } }) => {
-    const v = videoElRef.current;
-    if (!v || duration <= 0 || barWidth <= 0) return;
-    const ratio = Math.min(1, Math.max(0, evt.nativeEvent.locationX / barWidth));
-    v.currentTime = ratio * duration;
+  const computeWebSeekRatio = (clientX: number): number => {
+    const el = seekDivRef.current;
+    if (!el) return 0;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0) return 0;
+    return Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
   };
 
-  const handleBarLayout = (e: LayoutChangeEvent) => {
-    setBarWidth(e.nativeEvent.layout.width || 1);
+  const commitWebSeek = (ratio: number) => {
+    const v = videoElRef.current;
+    const dur = v?.duration || duration;
+    if (!v || !Number.isFinite(dur) || dur <= 0) return;
+    const targetSec = Math.min(dur, Math.max(0, ratio * dur));
+    v.currentTime = targetSec;
+    setCurrentTime(targetSec);
   };
+
+  const handleSeekPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    e.stopPropagation();
+    e.preventDefault();
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // ignore pointer capture errors
+    }
+    isDraggingRef.current = true;
+    const r = computeWebSeekRatio(e.clientX);
+    scrubRatioRef.current = r;
+    setScrubRatio(r);
+  };
+
+  const handleSeekPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!isDraggingRef.current) return;
+    e.stopPropagation();
+    const r = computeWebSeekRatio(e.clientX);
+    scrubRatioRef.current = r;
+    setScrubRatio(r);
+  };
+
+  const finishWebSeek = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!isDraggingRef.current) return;
+    e.stopPropagation();
+    isDraggingRef.current = false;
+    try {
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      }
+    } catch {
+      // ignore
+    }
+    const r = scrubRatioRef.current ?? computeWebSeekRatio(e.clientX);
+    commitWebSeek(r);
+    scrubRatioRef.current = null;
+    setScrubRatio(null);
+  };
+
+  const displayRatio = scrubRatio !== null ? scrubRatio : progressRatio;
+  const displayTime = scrubRatio !== null && duration > 0 ? scrubRatio * duration : currentTime;
 
   const handleToggleFullscreen = async () => {
     try {
@@ -633,16 +683,79 @@ export function WebCustomVideoPlayer({
             </View>
 
             <View style={styles.playerBottomBar}>
+              {scrubRatio !== null && duration > 0 && (
+                <View style={styles.scrubPreviewWrap} pointerEvents="none">
+                  <Text style={styles.scrubPreviewText}>
+                    {formatTime(displayTime)} / {formatTime(duration)}
+                  </Text>
+                </View>
+              )}
               <View style={styles.timeRow}>
-                <Text style={styles.timeText}>{formatTime(currentTime)}</Text>
-                <Pressable
-                  style={styles.seekTrack}
-                  onLayout={handleBarLayout}
-                  onPress={handleSeekBarPress}
+                <Text style={styles.timeText}>{formatTime(displayTime)}</Text>
+                <div
+                  ref={seekDivRef}
+                  onClick={(e) => e.stopPropagation()}
+                  onPointerDown={handleSeekPointerDown}
+                  onPointerMove={handleSeekPointerMove}
+                  onPointerUp={finishWebSeek}
+                  onPointerCancel={finishWebSeek}
+                  style={{
+                    flex: 1,
+                    height: 36,
+                    display: 'flex',
+                    alignItems: 'center',
+                    position: 'relative',
+                    cursor: 'pointer',
+                    touchAction: 'none',
+                    userSelect: 'none',
+                  }}
                 >
-                  <View style={[styles.seekBuffered, { width: `${bufferedRatio * 100}%` }]} />
-                  <View style={[styles.seekFill, { width: `${progressRatio * 100}%` }]} />
-                </Pressable>
+                  <div
+                    style={{
+                      width: '100%',
+                      height: scrubRatio !== null ? 8 : 6,
+                      backgroundColor: 'rgba(255,255,255,0.22)',
+                      borderRadius: 4,
+                      overflow: 'hidden',
+                      position: 'relative',
+                      pointerEvents: 'none',
+                      transition: 'height 120ms ease',
+                    }}
+                  >
+                    <div
+                      style={{
+                        position: 'absolute',
+                        left: 0,
+                        top: 0,
+                        bottom: 0,
+                        width: `${bufferedRatio * 100}%`,
+                        backgroundColor: 'rgba(255,255,255,0.34)',
+                        borderRadius: 4,
+                      }}
+                    />
+                    <div
+                      style={{
+                        height: '100%',
+                        width: `${displayRatio * 100}%`,
+                        backgroundColor: '#818cf8',
+                        borderRadius: 4,
+                      }}
+                    />
+                  </div>
+                  <div
+                    style={{
+                      position: 'absolute',
+                      left: `calc(${displayRatio * 100}% - ${scrubRatio !== null ? 10 : 8}px)`,
+                      width: scrubRatio !== null ? 20 : 16,
+                      height: scrubRatio !== null ? 20 : 16,
+                      borderRadius: '50%',
+                      backgroundColor: '#ffffff',
+                      border: '2px solid #818cf8',
+                      boxShadow: '0 0 8px rgba(129, 140, 248, 0.85)',
+                      pointerEvents: 'none',
+                    }}
+                  />
+                </div>
                 <Text style={styles.timeText}>{formatTime(duration)}</Text>
               </View>
 
@@ -1062,7 +1175,23 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   playerBottomBar: {
-    gap: 10,
+    gap: 8,
+  },
+  scrubPreviewWrap: {
+    alignSelf: 'center',
+    backgroundColor: 'rgba(15, 23, 42, 0.92)',
+    borderWidth: 1,
+    borderColor: '#6366f1',
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 4,
+    marginBottom: -2,
+  },
+  scrubPreviewText: {
+    color: '#ffffff',
+    fontSize: 13,
+    fontWeight: '700',
+    fontVariant: ['tabular-nums'],
   },
   timeRow: {
     flexDirection: 'row',
@@ -1073,28 +1202,6 @@ const styles = StyleSheet.create({
     color: '#f1f5f9',
     fontSize: 12,
     fontVariant: ['tabular-nums'],
-  },
-  seekTrack: {
-    flex: 1,
-    height: 12,
-    justifyContent: 'center',
-    backgroundColor: 'rgba(255,255,255,0.2)',
-    borderRadius: 6,
-    overflow: 'hidden',
-    position: 'relative',
-  },
-  seekBuffered: {
-    position: 'absolute',
-    left: 0,
-    top: 0,
-    bottom: 0,
-    backgroundColor: 'rgba(255,255,255,0.32)',
-    borderRadius: 6,
-  },
-  seekFill: {
-    height: '100%',
-    backgroundColor: '#818cf8',
-    borderRadius: 6,
   },
   bottomActionsRow: {
     flexDirection: 'row',

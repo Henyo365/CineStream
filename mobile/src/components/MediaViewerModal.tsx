@@ -20,6 +20,7 @@ import {
   type LayoutChangeEvent,
   Linking,
   Modal,
+  PanResponder,
   Platform,
   Pressable,
   ScrollView,
@@ -321,6 +322,13 @@ function CustomNativePlayer({
   const [volume, setVolume] = useState(1);
   const [isMuted, setIsMuted] = useState(false);
   const [barWidth, setBarWidth] = useState(1);
+  const [scrubRatio, setScrubRatio] = useState<number | null>(null);
+  const [optimisticSeekSec, setOptimisticSeekSec] = useState<number | null>(null);
+  const scrubRatioRef = useRef<number | null>(null);
+  const optimisticSeekTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const barWidthRef = useRef(1);
+  const barLeftXRef = useRef(0);
+  const seekBarContainerRef = useRef<React.ComponentRef<typeof View>>(null);
 
   // Audio, Quality & Subtitles state
   const [tracksModalOpen, setTracksModalOpen] = useState(false);
@@ -361,7 +369,7 @@ function CustomNativePlayer({
       clearTimeout(hideTimerRef.current);
       hideTimerRef.current = null;
     }
-    if (isPlaying && !tracksModalOpen) {
+    if (isPlaying && !tracksModalOpen && scrubRatio === null) {
       hideTimerRef.current = setTimeout(() => {
         setControlsVisible(false);
       }, 3500);
@@ -379,7 +387,7 @@ function CustomNativePlayer({
 
   const player = useVideoPlayer(videoSource, (p) => {
     p.loop = false;
-    p.timeUpdateEventInterval = 1;
+    p.timeUpdateEventInterval = 0.5;
     p.bufferOptions = {
       preferredForwardBufferDuration: 30,
       minBufferForPlayback: 2.5,
@@ -577,8 +585,21 @@ function CustomNativePlayer({
       if (seekFeedbackTimerRef.current) {
         clearTimeout(seekFeedbackTimerRef.current);
       }
+      if (optimisticSeekTimerRef.current) {
+        clearTimeout(optimisticSeekTimerRef.current);
+      }
     };
   }, [episodeKey, progressTitle, title, posterThumbnail]);
+
+  useEffect(() => {
+    if (optimisticSeekSec !== null && Math.abs(currentTime - optimisticSeekSec) < 2.5) {
+      setOptimisticSeekSec(null);
+      if (optimisticSeekTimerRef.current) {
+        clearTimeout(optimisticSeekTimerRef.current);
+        optimisticSeekTimerRef.current = null;
+      }
+    }
+  }, [currentTime, optimisticSeekSec]);
 
   // Load external VTT cues when selected
   useEffect(() => {
@@ -602,7 +623,7 @@ function CustomNativePlayer({
   }, [selectedExtSubUrl, backendUrl, referer, accessPin]);
 
   useEffect(() => {
-    if (controlsVisible && isPlaying && !tracksModalOpen) {
+    if (controlsVisible && isPlaying && !tracksModalOpen && scrubRatio === null) {
       resetHideTimer();
     } else if (hideTimerRef.current) {
       clearTimeout(hideTimerRef.current);
@@ -611,7 +632,7 @@ function CustomNativePlayer({
     return () => {
       if (hideTimerRef.current) clearTimeout(hideTimerRef.current);
     };
-  }, [controlsVisible, isPlaying, tracksModalOpen]);
+  }, [controlsVisible, isPlaying, tracksModalOpen, scrubRatio]);
 
   useEffect(() => {
     if (status === 'error') {
@@ -743,15 +764,82 @@ function CustomNativePlayer({
     };
   }, []);
 
-  const handleSeekBarPress = (evt: { nativeEvent: { locationX: number } }) => {
-    if (duration <= 0 || barWidth <= 0) return;
-    const ratio = Math.min(1, Math.max(0, evt.nativeEvent.locationX / barWidth));
-    player.currentTime = ratio * duration;
+  const computeRatioFromPageX = (pageX: number): number => {
+    const w = barWidthRef.current;
+    if (w <= 0) return 0;
+    return Math.min(1, Math.max(0, (pageX - barLeftXRef.current) / w));
   };
 
-  const handleBarLayout = (e: LayoutChangeEvent) => {
-    setBarWidth(e.nativeEvent.layout.width || 1);
+  const commitSeekRatio = (ratio: number) => {
+    const dur = latestPosRef.current.duration;
+    if (dur <= 0) return;
+    const targetSec = Math.min(dur, Math.max(0, ratio * dur));
+    player.currentTime = targetSec;
+    setOptimisticSeekSec(targetSec);
+    stallRef.current = { lastTime: targetSec, stuckTicks: 0, nudged: false };
+    if (optimisticSeekTimerRef.current) clearTimeout(optimisticSeekTimerRef.current);
+    optimisticSeekTimerRef.current = setTimeout(() => {
+      setOptimisticSeekSec(null);
+      optimisticSeekTimerRef.current = null;
+    }, 1500);
   };
+
+  const seekPanResponder = useMemo(
+    () =>
+      PanResponder.create({
+        onStartShouldSetPanResponder: () => true,
+        onMoveShouldSetPanResponder: () => true,
+        onStartShouldSetPanResponderCapture: () => true,
+        onMoveShouldSetPanResponderCapture: () => true,
+        onPanResponderTerminationRequest: () => false,
+        onPanResponderGrant: (evt) => {
+          const { locationX, pageX } = evt.nativeEvent;
+          // Refresh left offset accurately right at touch start
+          barLeftXRef.current = pageX - locationX;
+          const r =
+            barWidthRef.current > 0
+              ? Math.min(1, Math.max(0, locationX / barWidthRef.current))
+              : 0;
+          scrubRatioRef.current = r;
+          setScrubRatio(r);
+        },
+        onPanResponderMove: (evt) => {
+          const r = computeRatioFromPageX(evt.nativeEvent.pageX);
+          scrubRatioRef.current = r;
+          setScrubRatio(r);
+        },
+        onPanResponderRelease: (evt) => {
+          const r =
+            scrubRatioRef.current ?? computeRatioFromPageX(evt.nativeEvent.pageX);
+          commitSeekRatio(r);
+          scrubRatioRef.current = null;
+          setScrubRatio(null);
+        },
+        onPanResponderTerminate: () => {
+          if (scrubRatioRef.current !== null) {
+            commitSeekRatio(scrubRatioRef.current);
+          }
+          scrubRatioRef.current = null;
+          setScrubRatio(null);
+        },
+      }),
+    [player],
+  );
+
+  const handleBarLayout = (e: LayoutChangeEvent) => {
+    const w = e.nativeEvent.layout.width || 1;
+    barWidthRef.current = w;
+    setBarWidth(w);
+    seekBarContainerRef.current?.measureInWindow((x: number) => {
+      if (Number.isFinite(x)) barLeftXRef.current = x;
+    });
+  };
+
+  const effectiveTime = optimisticSeekSec !== null ? optimisticSeekSec : currentTime;
+  const effectiveRatio =
+    duration > 0 ? Math.min(1, Math.max(0, effectiveTime / duration)) : progressRatio;
+  const displayRatio = scrubRatio !== null ? scrubRatio : effectiveRatio;
+  const displayTime = scrubRatio !== null && duration > 0 ? scrubRatio * duration : effectiveTime;
 
   const hasTrackOptions =
     audioTracks.length > 0 ||
@@ -989,16 +1077,42 @@ function CustomNativePlayer({
 
           {/* Bottom bar */}
           <View style={styles.playerBottomBar}>
+            {scrubRatio !== null && duration > 0 && (
+              <View style={styles.scrubPreviewWrap} pointerEvents="none">
+                <Text style={styles.scrubPreviewText}>
+                  {formatTime(displayTime)} / {formatTime(duration)}
+                </Text>
+              </View>
+            )}
             <View style={styles.timeRow}>
-              <Text style={styles.timeText}>{formatTime(currentTime)}</Text>
-              <Pressable
-                style={styles.seekTrack}
+              <Text style={styles.timeText}>{formatTime(displayTime)}</Text>
+              <View
+                ref={seekBarContainerRef}
+                style={styles.seekHitArea}
                 onLayout={handleBarLayout}
-                onPress={handleSeekBarPress}
+                {...seekPanResponder.panHandlers}
               >
-                <View style={[styles.seekBuffered, { width: `${bufferedRatio * 100}%` }]} />
-                <View style={[styles.seekFill, { width: `${progressRatio * 100}%` }]} />
-              </Pressable>
+                <View
+                  pointerEvents="none"
+                  style={[styles.seekTrack, scrubRatio !== null && styles.seekTrackActive]}
+                >
+                  <View style={[styles.seekBuffered, { width: `${bufferedRatio * 100}%` }]} />
+                  <View style={[styles.seekFill, { width: `${displayRatio * 100}%` }]} />
+                </View>
+                <View
+                  pointerEvents="none"
+                  style={[
+                    styles.seekThumb,
+                    scrubRatio !== null && styles.seekThumbActive,
+                    {
+                      left: Math.min(
+                        Math.max(0, barWidth - (scrubRatio !== null ? 20 : 16)),
+                        Math.max(0, displayRatio * barWidth - (scrubRatio !== null ? 10 : 8)),
+                      ),
+                    },
+                  ]}
+                />
+              </View>
               <Text style={styles.timeText}>{formatTime(duration)}</Text>
             </View>
 
@@ -1909,27 +2023,70 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontVariant: ['tabular-nums'],
   },
-  seekTrack: {
+  seekHitArea: {
     flex: 1,
-    height: 12,
+    height: 36,
     justifyContent: 'center',
-    backgroundColor: 'rgba(255,255,255,0.2)',
-    borderRadius: 6,
+    position: 'relative',
+  },
+  seekTrack: {
+    width: '100%',
+    height: 6,
+    justifyContent: 'center',
+    backgroundColor: 'rgba(255,255,255,0.24)',
+    borderRadius: 4,
     overflow: 'hidden',
     position: 'relative',
+  },
+  seekTrackActive: {
+    height: 8,
   },
   seekBuffered: {
     position: 'absolute',
     left: 0,
     top: 0,
     bottom: 0,
-    backgroundColor: 'rgba(255,255,255,0.32)',
-    borderRadius: 6,
+    backgroundColor: 'rgba(255,255,255,0.38)',
+    borderRadius: 4,
   },
   seekFill: {
     height: '100%',
     backgroundColor: '#818cf8',
-    borderRadius: 6,
+    borderRadius: 4,
+  },
+  seekThumb: {
+    position: 'absolute',
+    width: 16,
+    height: 16,
+    borderRadius: 8,
+    backgroundColor: '#ffffff',
+    borderWidth: 2.5,
+    borderColor: '#6366f1',
+    shadowColor: '#000',
+    shadowOpacity: 0.45,
+    shadowRadius: 3,
+    elevation: 4,
+  },
+  seekThumbActive: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    borderWidth: 3,
+  },
+  scrubPreviewWrap: {
+    alignSelf: 'center',
+    backgroundColor: 'rgba(15, 23, 42, 0.88)',
+    paddingHorizontal: 12,
+    paddingVertical: 5,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(129, 140, 248, 0.5)',
+  },
+  scrubPreviewText: {
+    color: '#ffffff',
+    fontSize: 13,
+    fontWeight: '700',
+    fontVariant: ['tabular-nums'],
   },
   seekFeedbackPill: {
     position: 'absolute',
