@@ -270,6 +270,7 @@ function CustomNativePlayer({
   accessPin,
   referer,
   episodeKey,
+  initialPositionSec,
   title,
   progressTitle,
   posterThumbnail,
@@ -281,6 +282,7 @@ function CustomNativePlayer({
   onPrev,
   onNext,
   onWatched,
+  onRecoverStream,
   onFallback,
   onClose,
 }: {
@@ -290,6 +292,7 @@ function CustomNativePlayer({
   accessPin?: string;
   referer?: string;
   episodeKey?: string;
+  initialPositionSec?: number;
   title: string;
   progressTitle?: string;
   posterThumbnail?: string;
@@ -301,12 +304,14 @@ function CustomNativePlayer({
   onPrev?: () => void;
   onNext?: () => void;
   onWatched?: (url: string) => void;
-  onFallback: (errorMessage?: string) => void;
+  onRecoverStream?: (resumeAtSec: number) => void;
+  onFallback: (errorMessage?: string, resumeAtSec?: number) => void;
   onClose: () => void;
 }) {
   const videoRef = useRef<VideoView>(null);
   const [controlsVisible, setControlsVisible] = useState(true);
   const [isLocked, setIsLocked] = useState(false);
+  const [isRecovering, setIsRecovering] = useState(false);
   const [seekFeedback, setSeekFeedback] = useState<{ label: string; side: 'left' | 'right' } | null>(null);
   const [playerWidth, setPlayerWidth] = useState(360);
   const [speedIdx, setSpeedIdx] = useState(0);
@@ -332,13 +337,24 @@ function CustomNativePlayer({
   const restoredRef = useRef(false);
   const watchedMarkedRef = useRef(false);
   const autoPickedAudioRef = useRef(false);
+  const lastSavedSecRef = useRef(-10);
+  const userPausedRef = useRef(false);
+  const stallRef = useRef({ lastTime: -1, stuckTicks: 0, nudged: false });
   const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const seekFeedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastTapRef = useRef<{ time: number; side: 'left' | 'right' | 'center' }>({
     time: 0,
     side: 'center',
   });
-  const latestPosRef = useRef({ currentTime: 0, duration: 0 });
+  const latestPosRef = useRef({ currentTime: 0, duration: 0, status: 'idle' as string, isPlaying: false });
+
+  // Stabilize callbacks so parent re-renders (e.g. at 80% watched mark!) never re-run player effects
+  const onWatchedRef = useRef(onWatched);
+  onWatchedRef.current = onWatched;
+  const onFallbackRef = useRef(onFallback);
+  onFallbackRef.current = onFallback;
+  const onRecoverRef = useRef(onRecoverStream);
+  onRecoverRef.current = onRecoverStream;
 
   const resetHideTimer = () => {
     if (hideTimerRef.current) {
@@ -365,8 +381,10 @@ function CustomNativePlayer({
     p.loop = false;
     p.timeUpdateEventInterval = 1;
     p.bufferOptions = {
-      preferredForwardBufferDuration: 60,
-      minBufferForPlayback: 3,
+      preferredForwardBufferDuration: 30,
+      minBufferForPlayback: 2.5,
+      maxBufferBytes: 32 * 1024 * 1024,
+      prioritizeTimeOverSizeThreshold: false,
       waitsToMinimizeStalling: true,
     };
     p.play();
@@ -392,7 +410,7 @@ function CustomNativePlayer({
   const bufferedRatio =
     duration > 0 ? Math.min(1, Math.max(progressRatio, bufferedPosition / duration)) : 0;
 
-  latestPosRef.current = { currentTime, duration };
+  latestPosRef.current = { currentTime, duration, status, isPlaying };
 
   const audioTracksEvt = useEvent(player, 'availableAudioTracksChange', {
     availableAudioTracks: player.availableAudioTracks ?? [],
@@ -438,18 +456,24 @@ function CustomNativePlayer({
     }
   }, [status, player, audioTracksEvt, subTracksEvt]);
 
-  // Restore saved playback position once ready
+  // Restore saved playback position (or exact stream-recovery timestamp) once ready
   useEffect(() => {
-    if (status === 'readyToPlay' && episodeKey && !restoredRef.current) {
+    if (status === 'readyToPlay' && !restoredRef.current) {
       restoredRef.current = true;
-      void loadPlaybackProgress().then((all) => {
-        const saved = all[episodeKey];
-        if (saved && saved.position > 5 && saved.duration > 0 && saved.position < saved.duration - 10) {
-          player.currentTime = saved.position;
-        }
-      });
+      if (initialPositionSec && initialPositionSec > 3) {
+        player.currentTime = initialPositionSec;
+        return;
+      }
+      if (episodeKey) {
+        void loadPlaybackProgress().then((all) => {
+          const saved = all[episodeKey];
+          if (saved && saved.position > 5 && saved.duration > 0 && saved.position < saved.duration - 10) {
+            player.currentTime = saved.position;
+          }
+        });
+      }
     }
-  }, [status, episodeKey, player]);
+  }, [status, episodeKey, initialPositionSec, player]);
 
   useEventListener(player, 'playToEnd', () => {
     const dur = player.duration || latestPosRef.current.duration;
@@ -460,7 +484,7 @@ function CustomNativePlayer({
       });
       if (!watchedMarkedRef.current) {
         watchedMarkedRef.current = true;
-        onWatched?.(episodeKey);
+        onWatchedRef.current?.(episodeKey);
       }
     }
     if (hasNext) {
@@ -479,10 +503,12 @@ function CustomNativePlayer({
     return () => clearTimeout(t);
   }, [nextCountdown, onNext]);
 
-  // Save playback progress & mark watched at 80%
+  // Throttled playback progress save (every 10s) & mark watched at 80%
   useEffect(() => {
     if (!episodeKey || duration <= 0) return;
-    if (Math.floor(currentTime) % 5 === 0 && currentTime > 2) {
+    const sec = Math.floor(currentTime);
+    if (sec > 4 && Math.abs(sec - lastSavedSecRef.current) >= 10) {
+      lastSavedSecRef.current = sec;
       void savePlaybackProgress(episodeKey, currentTime, duration, {
         title: progressTitle || title,
         thumbnail: posterThumbnail,
@@ -490,9 +516,53 @@ function CustomNativePlayer({
     }
     if (!watchedMarkedRef.current && currentTime / duration >= 0.8) {
       watchedMarkedRef.current = true;
-      onWatched?.(episodeKey);
+      onWatchedRef.current?.(episodeKey);
     }
-  }, [currentTime, duration, episodeKey, progressTitle, title, posterThumbnail, onWatched]);
+  }, [currentTime, duration, episodeKey, progressTitle, title, posterThumbnail]);
+
+  // Stall Watchdog: detects freezes/infinite rebuffering (e.g. after ~20m on HLS/CDN)
+  // Level 1 (8s): gentle seek nudge; Level 2 (16s): seamless fresh stream reconnect at exact timestamp!
+  useEffect(() => {
+    if (!hasLoadedOnce) return;
+    const timer = setInterval(() => {
+      const { currentTime: ct, duration: dur, status: st, isPlaying: playing } = latestPosRef.current;
+      if (userPausedRef.current || st === 'error') {
+        stallRef.current = { lastTime: ct, stuckTicks: 0, nudged: false };
+        setIsRecovering(false);
+        return;
+      }
+      if (dur > 0 && ct >= dur - 2) {
+        return;
+      }
+      const moved = Math.abs(ct - stallRef.current.lastTime) > 0.25;
+      if (moved && st === 'readyToPlay') {
+        stallRef.current = { lastTime: ct, stuckTicks: 0, nudged: false };
+        setIsRecovering(false);
+        return;
+      }
+      if (playing || st === 'loading') {
+        stallRef.current.stuckTicks += 1;
+        // Each tick is 2s -> 4 ticks = 8s stall, 8 ticks = 16s stall
+        if (stallRef.current.stuckTicks === 4 && !stallRef.current.nudged) {
+          stallRef.current.nudged = true;
+          setIsRecovering(true);
+          try {
+            const target = dur > 0 ? Math.min(dur - 1, ct + 0.6) : ct + 0.6;
+            player.currentTime = target;
+            player.play();
+          } catch {
+            // ignore nudge errors
+          }
+        } else if (stallRef.current.stuckTicks >= 8) {
+          stallRef.current.stuckTicks = 0;
+          stallRef.current.nudged = false;
+          setIsRecovering(true);
+          onRecoverRef.current?.(ct);
+        }
+      }
+    }, 2000);
+    return () => clearInterval(timer);
+  }, [hasLoadedOnce, player]);
 
   // Save final position immediately on unmount
   useEffect(() => {
@@ -545,9 +615,10 @@ function CustomNativePlayer({
 
   useEffect(() => {
     if (status === 'error') {
-      onFallback(error?.message);
+      const pos = latestPosRef.current.currentTime;
+      onFallbackRef.current(error?.message, pos);
     }
-  }, [status, error, onFallback]);
+  }, [status, error]);
 
   const activeCueText = useMemo(() => {
     if (extCues.length === 0) return '';
@@ -557,6 +628,7 @@ function CustomNativePlayer({
 
   const handleTogglePlay = () => {
     if (isPlaying) {
+      userPausedRef.current = true;
       player.pause();
       if (episodeKey && duration > 0 && currentTime > 2) {
         void savePlaybackProgress(episodeKey, currentTime, duration, {
@@ -565,6 +637,7 @@ function CustomNativePlayer({
         });
       }
     } else {
+      userPausedRef.current = false;
       player.play();
     }
   };
@@ -753,12 +826,13 @@ function CustomNativePlayer({
           <Text style={styles.loadingText}>Cargando video...</Text>
         </View>
       )}
-      {status === 'loading' && hasLoadedOnce && (
+      {(status === 'loading' || isRecovering) && hasLoadedOnce && (
         <View
           style={[styles.rebufferBadge, { top: safeTop + 44, right: safeRight }]}
           pointerEvents="none"
         >
           <ActivityIndicator size="small" color="#ffffff" />
+          {isRecovering && <Text style={styles.rebufferText}>Reconectando...</Text>}
         </View>
       )}
 
@@ -826,6 +900,15 @@ function CustomNativePlayer({
             <Text style={styles.playerTitle} numberOfLines={1}>
               {title}
             </Text>
+            <TouchableOpacity
+              onPress={() => {
+                setIsRecovering(true);
+                onRecoverRef.current?.(latestPosRef.current.currentTime);
+              }}
+              style={styles.playerIconBtn}
+            >
+              <Ionicons name="refresh-outline" size={19} color="#ffffff" />
+            </TouchableOpacity>
             <TouchableOpacity
               onPress={() => {
                 setIsLocked(true);
@@ -1183,11 +1266,32 @@ export function MediaViewerModal({
   const [resolvedSubtitles, setResolvedSubtitles] = useState<SubtitleOption[] | undefined>(undefined);
   const [serverMenuOpen, setServerMenuOpen] = useState(false);
   const [nativeError, setNativeError] = useState<string | null>(null);
+  const [recoveryNonce, setRecoveryNonce] = useState(0);
+  const [resumeAtSec, setResumeAtSec] = useState<number | undefined>(undefined);
   const triedServerIdsRef = useRef<Set<string>>(new Set());
+  const autoRecoveryCountRef = useRef(0);
 
   useEffect(() => {
     triedServerIdsRef.current.clear();
+    autoRecoveryCountRef.current = 0;
+    setRecoveryNonce(0);
+    setResumeAtSec(undefined);
   }, [referer]);
+
+  useEffect(() => {
+    autoRecoveryCountRef.current = 0;
+    setRecoveryNonce(0);
+    setResumeAtSec(undefined);
+  }, [item]);
+
+  const handleRecoverStream = (atSec: number) => {
+    if (!item || item.type !== 'video') return;
+    if (atSec > 3) {
+      setResumeAtSec(atSec);
+    }
+    setNativeError(null);
+    setRecoveryNonce((n) => n + 1);
+  };
 
   const tryNextServer = (fallbackError: string) => {
     if (serverOptions && serverOptions.length > 1 && onSelectServer && item) {
@@ -1214,7 +1318,7 @@ export function MediaViewerModal({
     let cancelled = false;
     setResolving(true);
     setResolvedUrl(null);
-    void resolveVideoUrl(backendUrl, item.url, accessPin)
+    void resolveVideoUrl(backendUrl, item.url, accessPin, recoveryNonce > 0)
       .then((res) => {
         if (cancelled) return;
         if (res.unavailableReason) {
@@ -1254,7 +1358,7 @@ export function MediaViewerModal({
     return () => {
       cancelled = true;
     };
-  }, [item, backendUrl, accessPin, referer]);
+  }, [item, backendUrl, accessPin, referer, recoveryNonce]);
 
   if (!item) return null;
 
@@ -1462,12 +1566,14 @@ export function MediaViewerModal({
 
       return (
         <CustomNativePlayer
+          key={`${item.id}-${recoveryNonce}`}
           uri={proxiedUrl}
           isHls={isHls}
           backendUrl={backendUrl}
           accessPin={accessPin}
           referer={activeReferer}
           episodeKey={referer}
+          initialPositionSec={resumeAtSec}
           title={item.title || 'Reproductor'}
           progressTitle={episodeTitle || item.title}
           posterThumbnail={episodeThumbnail || item.thumbnail}
@@ -1479,7 +1585,20 @@ export function MediaViewerModal({
           onPrev={onPrevEpisode}
           onNext={onNextEpisode}
           onWatched={onWatched}
-          onFallback={(msg) => tryNextServer(msg || 'No se pudo reproducir este servidor')}
+          onRecoverStream={(atSec) => {
+            if (autoRecoveryCountRef.current < 4) {
+              autoRecoveryCountRef.current += 1;
+              handleRecoverStream(atSec);
+            }
+          }}
+          onFallback={(msg, atSec) => {
+            if (atSec && atSec > 15 && autoRecoveryCountRef.current < 2) {
+              autoRecoveryCountRef.current += 1;
+              handleRecoverStream(atSec);
+              return;
+            }
+            tryNextServer(msg || 'No se pudo reproducir este servidor');
+          }}
           onClose={onClose}
         />
       );
@@ -1685,9 +1804,18 @@ const styles = StyleSheet.create({
     position: 'absolute',
     top: 56,
     right: 16,
-    padding: 8,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
     borderRadius: 20,
-    backgroundColor: 'rgba(0,0,0,0.6)',
+    backgroundColor: 'rgba(15, 23, 42, 0.78)',
+  },
+  rebufferText: {
+    color: '#e0e7ff',
+    fontSize: 12,
+    fontWeight: '600',
   },
   nextUpBanner: {
     position: 'absolute',

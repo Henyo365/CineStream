@@ -286,6 +286,7 @@ async fn extract_post_handler(
 #[derive(Deserialize)]
 struct ResolveQuery {
     url: Option<String>,
+    refresh: Option<String>,
 }
 
 async fn resolve_handler(
@@ -302,11 +303,13 @@ async fn resolve_handler(
                 .into_response();
         }
     };
-    match video_resolver::resolve_video_stream(
+    let refresh = matches!(q.refresh.as_deref(), Some("true") | Some("1"));
+    match video_resolver::resolve_video_stream_opts(
         &state.client,
         &state.resolve_cache,
         raw.to_string(),
         0,
+        refresh,
     )
     .await
     {
@@ -397,9 +400,11 @@ async fn main() {
         .to_string();
 
     let client = Client::builder()
-        .pool_max_idle_per_host(16)
-        .pool_idle_timeout(Duration::from_secs(60))
-        .tcp_keepalive(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(15))
+        .read_timeout(Duration::from_secs(25))
+        .pool_max_idle_per_host(12)
+        .pool_idle_timeout(Duration::from_secs(30))
+        .tcp_keepalive(Duration::from_secs(20))
         .redirect(reqwest::redirect::Policy::limited(8))
         .build()
         .expect("failed to build HTTP client");
@@ -421,12 +426,21 @@ async fn main() {
         access_pin: Arc::new(access_pin),
     };
 
-    let protected_api = Router::new()
+    // JSON API routes WITH gzip compression
+    let protected_json_api = Router::new()
         .route("/ping", get(ping_handler))
         .route("/extract", get(extract_get_handler).post(extract_post_handler))
         .route("/search", get(search_handler))
         .route("/resolve", get(resolve_handler))
         .route("/resolve-batch", post(resolve_batch_handler))
+        .layer(CompressionLayer::new())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_access_pin_mw,
+        ));
+
+    // Streaming proxy route WITHOUT CompressionLayer (zero-copy raw binary video/HLS/images!)
+    let protected_proxy = Router::new()
         .route("/proxy", get(proxy_route_handler))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -434,8 +448,8 @@ async fn main() {
         ));
 
     let mut app = Router::new()
-        .route("/health", get(health_handler))
-        .nest("/api", protected_api)
+        .route("/health", get(health_handler).layer(CompressionLayer::new()))
+        .nest("/api", protected_json_api.merge(protected_proxy))
         .with_state(state);
 
     if let Some(public_dir) = find_public_dir() {
@@ -452,7 +466,6 @@ async fn main() {
         .allow_headers(Any);
 
     let app = app
-        .layer(CompressionLayer::new())
         .layer(cors)
         .layer(middleware::from_fn(security_headers_mw));
 

@@ -251,11 +251,21 @@ pub fn resolve_video_stream<'a>(
     raw_url: String,
     depth: u8,
 ) -> Pin<Box<dyn Future<Output = Result<ResolvedVideo, String>> + Send + 'a>> {
+    resolve_video_stream_opts(client, cache, raw_url, depth, false)
+}
+
+pub fn resolve_video_stream_opts<'a>(
+    client: &'a Client,
+    cache: &'a Cache<String, ResolvedVideo>,
+    raw_url: String,
+    depth: u8,
+    bypass_cache: bool,
+) -> Pin<Box<dyn Future<Output = Result<ResolvedVideo, String>> + Send + 'a>> {
     Box::pin(async move {
         let target = validate_target_url(&raw_url)?;
         let url_str = target.to_string();
 
-        if depth == 0 {
+        if depth == 0 && !bypass_cache {
             if let Some(hit) = cache.get(&url_str).await {
                 return Ok(hit);
             }

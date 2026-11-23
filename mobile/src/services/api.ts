@@ -192,14 +192,17 @@ export async function resolveVideoUrl(
   backendUrl: string,
   targetUrl: string,
   pin?: string,
+  refresh = false,
 ): Promise<ResolvedVideoResponse> {
   const base = normalizeBackendUrl(backendUrl);
   const headers: Record<string, string> = {};
   if (pin) headers['x-access-pin'] = pin;
 
   try {
+    const params = new URLSearchParams({ url: targetUrl.trim() });
+    if (refresh) params.set('refresh', '1');
     const res = await fetchWithTimeout(
-      `${base}/api/resolve?url=${encodeURIComponent(targetUrl.trim())}`,
+      `${base}/api/resolve?${params.toString()}`,
       { method: 'GET', headers },
       18_000,
     );

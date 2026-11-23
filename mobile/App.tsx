@@ -2135,7 +2135,11 @@ function MainScreen() {
         onPrevEpisode={() => void handleStepEpisode('prev')}
         onNextEpisode={() => void handleStepEpisode('next')}
         onWatched={(epUrl) => {
-          void markEpisodeWatched(epUrl).then(setWatchedUrls);
+          void markEpisodeWatched(epUrl).then((next) => {
+            setWatchedUrls((prev) =>
+              prev.length === next.length && prev[0] === next[0] ? prev : next,
+            );
+          });
         }}
         onClose={() => {
           setSelectedItem(null);

@@ -166,49 +166,112 @@ pub async fn proxy_handler(
                 .filter(|s| !s.is_empty())
         });
 
-    let mut req_builder = client
-        .get(target_url.as_str())
-        .header("User-Agent", DEFAULT_UA)
-        .header("Accept", "*/*")
-        .timeout(Duration::from_secs(20));
-
     let mut valid_referer: Option<String> = None;
     let target_host = target_url.host_str().unwrap_or("").to_lowercase();
+    let lower_path = target_url.path().to_lowercase();
+    let is_hls_url = lower_path.ends_with(".m3u8") || lower_path.contains("/m3u8/");
+    let is_disguised_zilla_seg =
+        target_host.contains("zilla-networks.com") && lower_path.contains("/segs/");
+    let is_video_segment = is_disguised_zilla_seg
+        || lower_path.ends_with(".ts")
+        || lower_path.ends_with(".m4s")
+        || lower_path.ends_with(".mp4")
+        || lower_path.ends_with(".webm");
 
     if target_host.contains("zilla-networks.com") {
         let origin = target_url.origin().ascii_serialization();
-        let ref_str = format!("{origin}/");
-        req_builder = req_builder
-            .header("Referer", &ref_str)
-            .header("Origin", &origin)
-            .header("Sec-Fetch-Dest", "empty")
-            .header("Sec-Fetch-Mode", "cors")
-            .header("Sec-Fetch-Site", "same-origin");
-        valid_referer = Some(ref_str);
+        valid_referer = Some(format!("{origin}/"));
     } else if let Some(ref_raw) = q.referer.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         if let Ok(ref_url) = validate_target_url(ref_raw) {
-            let ref_origin = ref_url.origin().ascii_serialization();
-            let same = ref_origin == target_url.origin().ascii_serialization();
-            req_builder = req_builder
-                .header("Referer", ref_url.as_str())
-                .header("Origin", &ref_origin)
-                .header("Sec-Fetch-Dest", "empty")
-                .header("Sec-Fetch-Mode", "cors")
-                .header("Sec-Fetch-Site", if same { "same-origin" } else { "cross-site" });
             valid_referer = Some(ref_url.to_string());
         }
     }
 
-    if let Some(range_val) = headers.get("range").and_then(|v| v.to_str().ok()) {
-        req_builder = req_builder.header("Range", range_val);
+    let range_header = headers
+        .get("range")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    // Retry up to 3 times on transient upstream errors (429/5xx/HTTP2 reset)
+    // and NEVER use a total .timeout() on streaming bodies — rely on Client connect/read timeouts!
+    let mut last_err: Option<String> = None;
+    let mut upstream_opt: Option<reqwest::Response> = None;
+
+    for attempt in 0..3u8 {
+        if attempt > 0 {
+            let delay_ms = if attempt == 1 { 250 } else { 650 };
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+
+        let mut req_builder = client
+            .get(target_url.as_str())
+            .header("User-Agent", DEFAULT_UA)
+            .header("Accept", "*/*");
+
+        if is_video_segment && !is_hls_url {
+            req_builder = req_builder.header("Accept-Encoding", "identity");
+        }
+        if attempt > 0 {
+            // Force a fresh socket if a pooled HTTP/2 or keep-alive connection went stale
+            req_builder = req_builder.header("Connection", "close");
+        }
+
+        if target_host.contains("zilla-networks.com") {
+            let origin = target_url.origin().ascii_serialization();
+            let ref_str = format!("{origin}/");
+            req_builder = req_builder
+                .header("Referer", &ref_str)
+                .header("Origin", &origin)
+                .header("Sec-Fetch-Dest", "empty")
+                .header("Sec-Fetch-Mode", "cors")
+                .header("Sec-Fetch-Site", "same-origin");
+        } else if let Some(ref ref_str) = valid_referer {
+            if let Ok(ref_url) = Url::parse(ref_str) {
+                let ref_origin = ref_url.origin().ascii_serialization();
+                let same = ref_origin == target_url.origin().ascii_serialization();
+                req_builder = req_builder
+                    .header("Referer", ref_url.as_str())
+                    .header("Origin", &ref_origin)
+                    .header("Sec-Fetch-Dest", "empty")
+                    .header("Sec-Fetch-Mode", "cors")
+                    .header("Sec-Fetch-Site", if same { "same-origin" } else { "cross-site" });
+            }
+        }
+
+        if let Some(ref range_val) = range_header {
+            req_builder = req_builder.header("Range", range_val.as_str());
+        }
+
+        match req_builder.send().await {
+            Ok(resp) => {
+                let st = resp.status().as_u16();
+                if matches!(st, 429 | 500 | 502 | 503 | 504) && attempt < 2 {
+                    last_err = Some(format!("HTTP {st}"));
+                    continue;
+                }
+                upstream_opt = Some(resp);
+                break;
+            }
+            Err(err) => {
+                last_err = Some(err.to_string());
+                if attempt < 2 {
+                    continue;
+                }
+            }
+        }
     }
 
-    let upstream = match req_builder.send().await {
-        Ok(r) => r,
-        Err(err) => {
+    let upstream = match upstream_opt {
+        Some(r) => r,
+        None => {
             return (
                 StatusCode::BAD_GATEWAY,
-                Json(json!({ "error": format!("Error al conectar con el origen: {err}") })),
+                Json(json!({
+                    "error": format!(
+                        "Error al conectar con el origen: {}",
+                        last_err.unwrap_or_else(|| "desconocido".to_string())
+                    )
+                })),
             )
                 .into_response();
         }
@@ -230,10 +293,7 @@ pub async fn proxy_handler(
         .unwrap_or("")
         .to_lowercase();
 
-    let lower_path = target_url.path().to_lowercase();
-    let is_hls = upstream_ct.contains("mpegurl")
-        || lower_path.ends_with(".m3u8")
-        || lower_path.contains("/m3u8/");
+    let is_hls = upstream_ct.contains("mpegurl") || is_hls_url;
 
     if is_hls && status.is_success() {
         let text = match upstream.text().await {
@@ -285,6 +345,18 @@ pub async fn proxy_handler(
         .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK));
 
     let mut has_cache_control = false;
+    let mut content_type_set = false;
+
+    if is_disguised_zilla_seg {
+        let seg_mime = if lower_path.ends_with("init.html") {
+            "video/mp4"
+        } else {
+            "video/iso.segment"
+        };
+        resp_builder = resp_builder.header("content-type", seg_mime);
+        content_type_set = true;
+    }
+
     for h_name in [
         "content-type",
         "content-length",
@@ -297,12 +369,19 @@ pub async fn proxy_handler(
                 has_cache_control = true;
             }
             if h_name == "content-type" {
+                if content_type_set {
+                    continue;
+                }
                 if let Ok(s) = val.to_str() {
                     if s.contains("application/octet-stream") {
                         let inferred = if lower_path.ends_with(".mp4") {
                             Some("video/mp4")
                         } else if lower_path.ends_with(".webm") {
                             Some("video/webm")
+                        } else if lower_path.ends_with(".m4s") {
+                            Some("video/iso.segment")
+                        } else if lower_path.ends_with(".ts") {
+                            Some("video/mp2t")
                         } else if lower_path.ends_with(".pdf") {
                             Some("application/pdf")
                         } else if lower_path.ends_with(".webp") {
@@ -327,7 +406,7 @@ pub async fn proxy_handler(
         }
     }
 
-    if !has_cache_control && upstream_ct.starts_with("image/") {
+    if !has_cache_control && (upstream_ct.starts_with("image/") || is_video_segment) {
         resp_builder = resp_builder.header("cache-control", "public, max-age=3600");
     }
 

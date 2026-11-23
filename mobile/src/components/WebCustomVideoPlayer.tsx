@@ -117,7 +117,16 @@ export function WebCustomVideoPlayer({
 
   const restoredRef = useRef(false);
   const watchedMarkedRef = useRef(false);
+  const lastSavedSecRef = useRef(-10);
   const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Stabilize callbacks so parent re-renders NEVER destroy & recreate the HLS instance!
+  const onWatchedRef = useRef(onWatched);
+  onWatchedRef.current = onWatched;
+  const hasNextRef = useRef(hasNext);
+  hasNextRef.current = hasNext;
+  const metaRef = useRef({ title, posterThumbnail });
+  metaRef.current = { title, posterThumbnail };
 
   useEffect(() => {
     if (controlsVisible && isPlaying && !tracksModalOpen) {
@@ -138,10 +147,12 @@ export function WebCustomVideoPlayer({
 
     restoredRef.current = false;
     watchedMarkedRef.current = false;
+    lastSavedSecRef.current = -10;
     setIsBuffering(true);
     setHasLoadedOnce(false);
 
     let hls: Hls | null = null;
+    let mediaRecoveryAttempts = 0;
 
     const syncTracks = (instance: Hls) => {
       const aList = (instance.audioTracks ?? []).map((t, idx) => ({
@@ -172,12 +183,12 @@ export function WebCustomVideoPlayer({
     if (isHls && Hls.isSupported()) {
       hls = new Hls({
         startLevel: -1,
-        maxBufferLength: 60,
-        maxMaxBufferLength: 120,
-        backBufferLength: 30,
-        fragLoadingTimeOut: 20000,
-        fragLoadingMaxRetry: 6,
-        fragLoadingRetryDelay: 500,
+        maxBufferLength: 35,
+        maxMaxBufferLength: 60,
+        backBufferLength: 20,
+        fragLoadingTimeOut: 25000,
+        fragLoadingMaxRetry: 8,
+        fragLoadingRetryDelay: 600,
       });
       hlsRef.current = hls;
       hls.loadSource(uri);
@@ -211,6 +222,15 @@ export function WebCustomVideoPlayer({
       hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, (_e, data) => {
         setSelectedAudioId(data.id);
       });
+      hls.on(Hls.Events.ERROR, (_e, data) => {
+        if (!data.fatal || !hls) return;
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+          hls.startLoad();
+        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveryAttempts < 3) {
+          mediaRecoveryAttempts += 1;
+          hls.recoverMediaError();
+        }
+      });
     } else {
       video.src = uri;
       void video.play().catch(() => {});
@@ -221,8 +241,8 @@ export function WebCustomVideoPlayer({
       const d = dur ?? (video.duration || 0);
       if (episodeKey && d > 0 && ct > 2) {
         void savePlaybackProgress(episodeKey, ct, d, {
-          title,
-          thumbnail: posterThumbnail,
+          title: metaRef.current.title,
+          thumbnail: metaRef.current.posterThumbnail,
         });
       }
     };
@@ -238,10 +258,10 @@ export function WebCustomVideoPlayer({
         persistProgressNow(video.duration, video.duration);
         if (!watchedMarkedRef.current) {
           watchedMarkedRef.current = true;
-          onWatched?.(episodeKey);
+          onWatchedRef.current?.(episodeKey);
         }
       }
-      if (hasNext) {
+      if (hasNextRef.current) {
         setNextCountdown(5);
       }
     };
@@ -278,15 +298,17 @@ export function WebCustomVideoPlayer({
       setIsBuffering(false);
       setHasLoadedOnce(true);
       if (episodeKey && dur > 0) {
-        if (Math.floor(ct) % 5 === 0 && ct > 2) {
+        const sec = Math.floor(ct);
+        if (sec > 4 && Math.abs(sec - lastSavedSecRef.current) >= 10) {
+          lastSavedSecRef.current = sec;
           void savePlaybackProgress(episodeKey, ct, dur, {
-            title,
-            thumbnail: posterThumbnail,
+            title: metaRef.current.title,
+            thumbnail: metaRef.current.posterThumbnail,
           });
         }
         if (!watchedMarkedRef.current && ct / dur >= 0.8) {
           watchedMarkedRef.current = true;
-          onWatched?.(episodeKey);
+          onWatchedRef.current?.(episodeKey);
         }
       }
     };
@@ -313,7 +335,7 @@ export function WebCustomVideoPlayer({
         hlsRef.current = null;
       }
     };
-  }, [uri, isHls, episodeKey, onWatched]);
+  }, [uri, isHls, episodeKey]);
 
   useEffect(() => {
     if (nextCountdown === null) return;
