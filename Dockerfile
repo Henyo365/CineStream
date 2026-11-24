@@ -16,9 +16,9 @@ RUN pnpm install --frozen-lockfile
 COPY mobile ./mobile
 RUN EXPO_NO_TELEMETRY=1 pnpm --filter youanime-mobile exec expo export --platform web --output-dir /build/public
 
-# Stage 3: Minimal production runtime (Rust binary + Expo Web static files)
+# Stage 3: Minimal production runtime (Rust binary + ffmpeg for HLS-to-MP4 downloads + Expo Web static files)
 FROM debian:bookworm-slim AS runtime
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates ffmpeg && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=rust-builder /build/rust-engine/target/release/cinestream-engine /app/cinestream-engine
 COPY --from=web-builder /build/public /app/public

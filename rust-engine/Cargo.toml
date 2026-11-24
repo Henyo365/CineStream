@@ -1,6 +1,6 @@
 [package]
 name = "cinestream-engine"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 description = "High-performance Rust scraping, search, video resolver and HLS proxy engine for CineStream"
 

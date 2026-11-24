@@ -531,7 +531,7 @@ function CustomNativePlayer({
   // Stall Watchdog: detects freezes/infinite rebuffering (e.g. after ~20m on HLS/CDN)
   // Level 1 (8s): gentle seek nudge; Level 2 (16s): seamless fresh stream reconnect at exact timestamp!
   useEffect(() => {
-    if (!hasLoadedOnce) return;
+    if (!hasLoadedOnce || uri.startsWith('file://')) return;
     const timer = setInterval(() => {
       const { currentTime: ct, duration: dur, status: st, isPlaying: playing } = latestPosRef.current;
       if (userPausedRef.current || st === 'error') {
@@ -988,15 +988,22 @@ function CustomNativePlayer({
             <Text style={styles.playerTitle} numberOfLines={1}>
               {title}
             </Text>
-            <TouchableOpacity
-              onPress={() => {
-                setIsRecovering(true);
-                onRecoverRef.current?.(latestPosRef.current.currentTime);
-              }}
-              style={styles.playerIconBtn}
-            >
-              <Ionicons name="refresh-outline" size={19} color="#ffffff" />
-            </TouchableOpacity>
+            {uri.startsWith('file://') ? (
+              <View style={[styles.playerPillBtn, { backgroundColor: 'rgba(16, 185, 129, 0.25)' }]}>
+                <Ionicons name="cloud-done-outline" size={14} color="#6ee7b7" />
+                <Text style={[styles.playerPillText, { color: '#6ee7b7' }]}>Offline</Text>
+              </View>
+            ) : (
+              <TouchableOpacity
+                onPress={() => {
+                  setIsRecovering(true);
+                  onRecoverRef.current?.(latestPosRef.current.currentTime);
+                }}
+                style={styles.playerIconBtn}
+              >
+                <Ionicons name="refresh-outline" size={19} color="#ffffff" />
+              </TouchableOpacity>
+            )}
             <TouchableOpacity
               onPress={() => {
                 setIsLocked(true);
@@ -1429,6 +1436,15 @@ export function MediaViewerModal({
       return;
     }
 
+    // Local downloaded MP4 file — play directly 100% offline with zero network calls!
+    if (item.url.startsWith('file://')) {
+      setResolvedUrl(item.url);
+      setResolvedReferer(referer);
+      setResolvedEmbed(false);
+      setResolving(false);
+      return;
+    }
+
     let cancelled = false;
     setResolving(true);
     setResolvedUrl(null);
@@ -1478,7 +1494,10 @@ export function MediaViewerModal({
 
   const activeUrl = resolvedUrl || item.url;
   const activeReferer = resolvedReferer ?? referer;
-  const proxiedUrl = buildProxyUrl(backendUrl, activeUrl, activeReferer, accessPin);
+  const isLocalFile = activeUrl.startsWith('file://');
+  const proxiedUrl = isLocalFile
+    ? activeUrl
+    : buildProxyUrl(backendUrl, activeUrl, activeReferer, accessPin);
 
   const handleDownloadAndShare = async () => {
     if (Platform.OS === 'web') {
@@ -1516,9 +1535,10 @@ export function MediaViewerModal({
   };
 
   const isHls =
-    item.mimeType?.toLowerCase().includes('mpegurl') ||
-    /\/m3u8\//i.test(activeUrl) ||
-    /\.m3u8(\?|#|$)/i.test(activeUrl);
+    !isLocalFile &&
+    (item.mimeType?.toLowerCase().includes('mpegurl') ||
+      /\/m3u8\//i.test(activeUrl) ||
+      /\.m3u8(\?|#|$)/i.test(activeUrl));
 
   const isUsingNativePlayer =
     item.type === 'video' && !resolving && !resolvedEmbed && !forceWebView;
@@ -1692,7 +1712,7 @@ export function MediaViewerModal({
           progressTitle={episodeTitle || item.title}
           posterThumbnail={episodeThumbnail || item.thumbnail}
           externalSubtitles={resolvedSubtitles}
-          hasServers={Boolean(serverOptions && serverOptions.length > 1)}
+          hasServers={!isLocalFile && Boolean(serverOptions && serverOptions.length > 1)}
           onOpenServers={() => setServerMenuOpen(true)}
           hasPrev={hasPrevEpisode}
           hasNext={hasNextEpisode}
@@ -1700,7 +1720,7 @@ export function MediaViewerModal({
           onNext={onNextEpisode}
           onWatched={onWatched}
           onRecoverStream={(atSec) => {
-            if (autoRecoveryCountRef.current < 4) {
+            if (!isLocalFile && autoRecoveryCountRef.current < 4) {
               autoRecoveryCountRef.current += 1;
               handleRecoverStream(atSec);
             }

@@ -65,3 +65,38 @@ export interface HistoryEntry {
     pdfs: number;
   };
 }
+
+export interface DownloadedEpisode {
+  id: string;
+  episodeUrl: string;
+  episodeTitle: string;
+  episodeNumber: number | null;
+  animeKey: string;
+  animeTitle: string;
+  animeThumbnail?: string;
+  localThumbnailUri?: string;
+  fileUri: string;
+  fileName: string;
+  sizeBytes: number;
+  downloadedAt: number;
+}
+
+export interface DownloadedAnimeGroup {
+  animeKey: string;
+  animeTitle: string;
+  thumbnailUri?: string;
+  remoteThumbnail?: string;
+  episodes: DownloadedEpisode[];
+  totalSizeBytes: number;
+  latestDownloadedAt: number;
+}
+
+export interface ActiveDownloadState {
+  episodeUrl: string;
+  animeTitle: string;
+  episodeTitle: string;
+  phase: 'resolving' | 'preparing' | 'downloading';
+  progress: number;
+  bytesWritten?: number;
+  totalBytes?: number;
+}

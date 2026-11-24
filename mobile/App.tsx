@@ -1,5 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import * as Clipboard from 'expo-clipboard';
+import * as Sharing from 'expo-sharing';
 import { StatusBar } from 'expo-status-bar';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -57,15 +58,25 @@ import {
   toggleFavorite,
   type WatchProgress,
 } from './src/services/storage';
+import {
+  deleteDownloadedAnime,
+  deleteDownloadedEpisode,
+  downloadEpisodeMedia,
+  formatBytes,
+  groupDownloadsByAnime,
+  loadDownloadedEpisodes,
+} from './src/services/downloads';
 import { FIXED_SOURCES, type FixedSource } from './src/sources';
 import type {
+  ActiveDownloadState,
+  DownloadedEpisode,
   ExtractionResult,
   HistoryEntry,
   MediaItem,
   PageLink,
 } from './src/types';
 
-type BottomTab = 'home' | 'servers' | 'favorites' | 'history';
+type BottomTab = 'home' | 'servers' | 'downloads' | 'favorites' | 'history';
 type MediaFilterTab = 'videos' | 'images' | 'pdfs' | 'pages';
 
 function extractNumericOrder(page: PageLink): number | null {
@@ -162,8 +173,17 @@ function MainScreen() {
   >([]);
   const [customSources, setCustomSources] = useState<FixedSource[]>([]);
 
+  // Offline downloads (mobile) & active download progress (mobile + web)
+  const [downloads, setDownloads] = useState<DownloadedEpisode[]>([]);
+  const [activeDownloads, setActiveDownloads] = useState<Record<string, ActiveDownloadState>>({});
+  const [selectedDownloadAnimeKey, setSelectedDownloadAnimeKey] = useState<string | null>(null);
+  const [offlineQueue, setOfflineQueue] = useState<DownloadedEpisode[]>([]);
+  const [downloadToast, setDownloadToast] = useState<string | null>(null);
+
   const requestIdRef = useRef(0);
   const probeIdRef = useRef(0);
+  const downloadControllersRef = useRef<Record<string, AbortController>>({});
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastPickerRequestRef = useRef<{ url: string; title?: string; thumbnail?: string } | null>(
     null,
   );
@@ -213,6 +233,7 @@ function MainScreen() {
         savedWatched,
         savedCustom,
         savedSearches,
+        savedDownloads,
       ] = await Promise.all([
         loadBackendUrl(),
         loadAccessPin(),
@@ -221,6 +242,7 @@ function MainScreen() {
         loadWatchedEpisodes(),
         loadCustomSources(),
         loadRecentSearches(),
+        loadDownloadedEpisodes(),
       ]);
       setBackendUrl(savedUrl);
       setAccessPin(savedPin);
@@ -229,6 +251,7 @@ function MainScreen() {
       setWatchedUrls(savedWatched);
       setCustomSources(savedCustom);
       setRecentSearches(savedSearches);
+      setDownloads(savedDownloads);
       const cwList = await refreshContinueWatching();
       await loadUrl(FIXED_SOURCES[0].url, {
         backendOverride: savedUrl,
@@ -472,9 +495,211 @@ function MainScreen() {
     }
   };
 
+  const showDownloadToast = (msg: string) => {
+    setDownloadToast(msg);
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => {
+      setDownloadToast(null);
+      toastTimerRef.current = null;
+    }, 3600);
+  };
+
+  const downloadsByUrl = useMemo(() => {
+    const map: Record<string, DownloadedEpisode> = {};
+    for (const d of downloads) {
+      map[d.episodeUrl] = d;
+    }
+    return map;
+  }, [downloads]);
+
+  const groupedDownloads = useMemo(() => groupDownloadsByAnime(downloads), [downloads]);
+
+  const activeDownloadsList = useMemo(
+    () => Object.values(activeDownloads),
+    [activeDownloads],
+  );
+
+  const playOfflineEpisode = (ep: DownloadedEpisode, groupEpisodes?: DownloadedEpisode[]) => {
+    setOfflineQueue(groupEpisodes && groupEpisodes.length > 0 ? groupEpisodes : [ep]);
+    setPickerVideos([]);
+    setPickerTitle(`${ep.animeTitle} • ${ep.episodeTitle}`);
+    setPickerThumb(ep.localThumbnailUri || ep.animeThumbnail);
+    setViewerReferer(ep.episodeUrl);
+    setSelectedItem({
+      id: `offline_${ep.id}`,
+      type: 'video',
+      url: ep.fileUri,
+      title: `${ep.animeTitle} - ${ep.episodeTitle}`,
+      thumbnail: ep.localThumbnailUri || ep.animeThumbnail,
+      mimeType: 'video/mp4',
+      isEmbed: false,
+      sourceTag: 'offline',
+    });
+  };
+
+  const handleCancelDownload = (episodeUrl: string) => {
+    const ctrl = downloadControllersRef.current[episodeUrl];
+    if (ctrl) {
+      ctrl.abort();
+      delete downloadControllersRef.current[episodeUrl];
+    }
+    setActiveDownloads((prev) => {
+      if (!(episodeUrl in prev)) return prev;
+      const next = { ...prev };
+      delete next[episodeUrl];
+      return next;
+    });
+  };
+
+  const handleStartDownload = async (opts: {
+    episodeUrl: string;
+    episodeTitle: string;
+    episodeNumber: number | null;
+    animeUrl?: string;
+    animeTitle: string;
+    animeThumbnail?: string;
+    preloadedVideos?: MediaItem[];
+  }) => {
+    if (activeDownloads[opts.episodeUrl]) {
+      handleCancelDownload(opts.episodeUrl);
+      showDownloadToast('Descarga cancelada');
+      return;
+    }
+
+    const existing = downloadsByUrl[opts.episodeUrl];
+    if (existing && Platform.OS !== 'web') {
+      const grp = groupedDownloads.find((g) => g.animeKey === existing.animeKey);
+      playOfflineEpisode(existing, grp?.episodes);
+      return;
+    }
+
+    const controller = new AbortController();
+    downloadControllersRef.current[opts.episodeUrl] = controller;
+
+    setActiveDownloads((prev) => ({
+      ...prev,
+      [opts.episodeUrl]: {
+        episodeUrl: opts.episodeUrl,
+        animeTitle: opts.animeTitle,
+        episodeTitle: opts.episodeTitle,
+        phase: 'resolving',
+        progress: 0,
+      },
+    }));
+
+    try {
+      const outcome = await downloadEpisodeMedia({
+        backendUrl,
+        accessPin,
+        animeUrl: opts.animeUrl,
+        animeTitle: opts.animeTitle,
+        animeThumbnail: opts.animeThumbnail,
+        episodeUrl: opts.episodeUrl,
+        episodeTitle: opts.episodeTitle,
+        episodeNumber: opts.episodeNumber,
+        preloadedVideos: opts.preloadedVideos,
+        signal: controller.signal,
+        onProgress: (st) => {
+          setActiveDownloads((prev) => ({
+            ...prev,
+            [opts.episodeUrl]: st,
+          }));
+        },
+      });
+
+      if (outcome.platform === 'native' && outcome.updatedList) {
+        setDownloads(outcome.updatedList);
+        showDownloadToast(`Descargado: ${opts.episodeTitle}`);
+      } else {
+        showDownloadToast(`Descargando: ${outcome.fileName}`);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'No se pudo descargar el episodio.';
+      if (!controller.signal.aborted) {
+        if (Platform.OS === 'web') {
+          showDownloadToast(`Error: ${msg}`);
+        } else {
+          Alert.alert('Error al descargar', msg);
+        }
+      }
+    } finally {
+      delete downloadControllersRef.current[opts.episodeUrl];
+      setActiveDownloads((prev) => {
+        if (!(opts.episodeUrl in prev)) return prev;
+        const next = { ...prev };
+        delete next[opts.episodeUrl];
+        return next;
+      });
+    }
+  };
+
+  const handleDeleteDownloadedEpisode = (ep: DownloadedEpisode) => {
+    Alert.alert(
+      'Eliminar descarga',
+      `¿Borrar "${ep.episodeTitle}" del almacenamiento?`,
+      [
+        { text: 'Cancelar', style: 'cancel' },
+        {
+          text: 'Eliminar',
+          style: 'destructive',
+          onPress: () => {
+            void deleteDownloadedEpisode(ep.episodeUrl).then((next) => {
+              setDownloads(next);
+              const stillHasAnime = next.some((d) => d.animeKey === ep.animeKey);
+              if (!stillHasAnime && selectedDownloadAnimeKey === ep.animeKey) {
+                setSelectedDownloadAnimeKey(null);
+              }
+            });
+          },
+        },
+      ],
+    );
+  };
+
+  const handleDeleteDownloadedAnime = (animeKey: string, animeTitle: string) => {
+    Alert.alert(
+      'Eliminar anime descargado',
+      `¿Borrar todos los episodios descargados de "${animeTitle}"?`,
+      [
+        { text: 'Cancelar', style: 'cancel' },
+        {
+          text: 'Eliminar todo',
+          style: 'destructive',
+          onPress: () => {
+            void deleteDownloadedAnime(animeKey).then((next) => {
+              setDownloads(next);
+              if (selectedDownloadAnimeKey === animeKey) {
+                setSelectedDownloadAnimeKey(null);
+              }
+            });
+          },
+        },
+      ],
+    );
+  };
+
+  const handleShareDownloadedEpisode = async (ep: DownloadedEpisode) => {
+    try {
+      if (await Sharing.isAvailableAsync()) {
+        await Sharing.shareAsync(ep.fileUri, {
+          mimeType: 'video/mp4',
+          dialogTitle: ep.fileName,
+        });
+      } else {
+        Alert.alert('Archivo guardado', ep.fileUri);
+      }
+    } catch (err) {
+      Alert.alert(
+        'Error',
+        err instanceof Error ? err.message : 'No se pudo compartir el archivo.',
+      );
+    }
+  };
+
   const handleGoBack = () => {
     if (selectedItem) {
       setSelectedItem(null);
+      setOfflineQueue([]);
       return true;
     }
     if (pickerVisible) {
@@ -483,6 +708,10 @@ function MainScreen() {
     }
     if (actionTarget) {
       setActionTarget(null);
+      return true;
+    }
+    if (bottomTab === 'downloads' && selectedDownloadAnimeKey) {
+      setSelectedDownloadAnimeKey(null);
       return true;
     }
     if (bottomTab !== 'home') {
@@ -675,26 +904,45 @@ function MainScreen() {
     );
   }, [result, episodesAsc, episodeFilter]);
 
+  const currentOfflineIndex = useMemo(() => {
+    if (offlineQueue.length === 0 || !viewerReferer) return -1;
+    return offlineQueue.findIndex((e) => e.episodeUrl === viewerReferer);
+  }, [offlineQueue, viewerReferer]);
+
   const currentEpisodeIndex = useMemo(() => {
     if (!viewerReferer || !result?.pages) return -1;
     return result.pages.findIndex((p) => p.url === viewerReferer);
   }, [viewerReferer, result]);
 
   const hasPrevEpisode = useMemo(() => {
+    if (offlineQueue.length > 0 && currentOfflineIndex >= 0) {
+      return currentOfflineIndex > 0;
+    }
     if (!result?.pages || currentEpisodeIndex < 0) return false;
     return pagesDescending
       ? currentEpisodeIndex + 1 < result.pages.length
       : currentEpisodeIndex > 0;
-  }, [result, currentEpisodeIndex, pagesDescending]);
+  }, [offlineQueue, currentOfflineIndex, result, currentEpisodeIndex, pagesDescending]);
 
   const hasNextEpisode = useMemo(() => {
+    if (offlineQueue.length > 0 && currentOfflineIndex >= 0) {
+      return currentOfflineIndex + 1 < offlineQueue.length;
+    }
     if (!result?.pages || currentEpisodeIndex < 0) return false;
     return pagesDescending
       ? currentEpisodeIndex > 0
       : currentEpisodeIndex + 1 < result.pages.length;
-  }, [result, currentEpisodeIndex, pagesDescending]);
+  }, [offlineQueue, currentOfflineIndex, result, currentEpisodeIndex, pagesDescending]);
 
   const handleStepEpisode = async (direction: 'prev' | 'next') => {
+    if (offlineQueue.length > 0 && currentOfflineIndex >= 0) {
+      const target =
+        offlineQueue[currentOfflineIndex + (direction === 'next' ? 1 : -1)];
+      if (target) {
+        playOfflineEpisode(target, offlineQueue);
+      }
+      return;
+    }
     if (!result?.pages || currentEpisodeIndex < 0) return;
     const delta =
       direction === 'next'
@@ -1477,26 +1725,76 @@ function MainScreen() {
           </ScrollView>
         )}
 
-        {/* Quick Play if current page already has videos */}
-        {result.videos.length > 0 && (
-          <TouchableOpacity
-            style={styles.watchNowBtn}
-            onPress={() => {
-              setPickerTitle(result.metadata.title);
-              setPickerThumb(result.metadata.poster || result.images[0]?.url);
-              setPickerVideos(result.videos);
-              setPickerReferer(result.metadata.sourceUrl);
-              setPickerLoading(false);
-              setPickerVisible(true);
-              triggerServerProbe(result.videos);
-            }}
-          >
-            <Ionicons name="play-circle" size={22} color="#ffffff" />
-            <Text style={styles.watchNowText}>
-              Reproducir ahora ({result.videos.length} opciones)
-            </Text>
-          </TouchableOpacity>
-        )}
+        {/* Quick Play + Download if current page already has videos (e.g. movies) */}
+        {result.videos.length > 0 && (() => {
+          const movieDl = activeDownloads[result.metadata.sourceUrl];
+          const movieSaved =
+            Platform.OS !== 'web' ? downloadsByUrl[result.metadata.sourceUrl] : undefined;
+          return (
+            <View style={styles.detailActionRow}>
+              <TouchableOpacity
+                style={[styles.watchNowBtn, styles.watchNowFlex]}
+                onPress={() => {
+                  setOfflineQueue([]);
+                  setPickerTitle(result.metadata.title);
+                  setPickerThumb(result.metadata.poster || result.images[0]?.url);
+                  setPickerVideos(result.videos);
+                  setPickerReferer(result.metadata.sourceUrl);
+                  setPickerLoading(false);
+                  setPickerVisible(true);
+                  triggerServerProbe(result.videos);
+                }}
+              >
+                <Ionicons name="play-circle" size={22} color="#ffffff" />
+                <Text style={styles.watchNowText} numberOfLines={1}>
+                  Reproducir ({result.videos.length})
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[
+                  styles.downloadMovieBtn,
+                  movieSaved && styles.downloadMovieBtnDone,
+                ]}
+                onPress={() =>
+                  void handleStartDownload({
+                    episodeUrl: result.metadata.sourceUrl,
+                    episodeTitle: result.metadata.title,
+                    episodeNumber: 1,
+                    animeUrl: result.metadata.sourceUrl,
+                    animeTitle: result.metadata.title,
+                    animeThumbnail: result.metadata.poster || result.images[0]?.url,
+                    preloadedVideos: result.videos,
+                  })
+                }
+              >
+                {movieDl ? (
+                  <>
+                    <ActivityIndicator size="small" color="#c7d2fe" />
+                    <Text style={styles.downloadMovieBtnText}>
+                      {movieDl.phase === 'resolving'
+                        ? '...'
+                        : movieDl.phase === 'preparing'
+                          ? `Prep ${movieDl.progress}%`
+                          : `${movieDl.progress}%`}
+                    </Text>
+                  </>
+                ) : movieSaved ? (
+                  <>
+                    <Ionicons name="cloud-done" size={20} color="#34d399" />
+                    <Text style={[styles.downloadMovieBtnText, { color: '#34d399' }]}>
+                      Offline
+                    </Text>
+                  </>
+                ) : (
+                  <>
+                    <Ionicons name="download-outline" size={20} color="#e0e7ff" />
+                    <Text style={styles.downloadMovieBtnText}>Descargar</Text>
+                  </>
+                )}
+              </TouchableOpacity>
+            </View>
+          );
+        })()}
 
         {/* Smart Continue / Start Next Episode CTA */}
         {result.videos.length === 0 && nextUnwatchedEp && (
@@ -1572,41 +1870,85 @@ function MainScreen() {
             <View style={[styles.episodesList, isWide && styles.episodesListWide]}>
               {sortedEpisodes.map((ep) => {
                 const watched = watchedUrls.includes(ep.url);
+                const activeDl = activeDownloads[ep.url];
+                const savedDl = Platform.OS !== 'web' ? downloadsByUrl[ep.url] : undefined;
                 return (
-                  <TouchableOpacity
+                  <View
                     key={ep.id}
                     style={[
                       styles.episodePill,
                       isWide && styles.episodePillWide,
                       watched && styles.episodePillWatched,
                     ]}
-                    onPress={() =>
-                      void openServerPickerForUrl(
-                        ep.url,
-                        ep.title,
-                        ep.thumbnail || result.metadata.poster,
-                      )
-                    }
-                    onLongPress={() => {
-                      void toggleEpisodeWatched(ep.url).then(setWatchedUrls);
-                    }}
-                    activeOpacity={0.75}
                   >
-                    <Ionicons
-                      name={watched ? 'checkmark-circle' : 'play-circle-outline'}
-                      size={22}
-                      color={watched ? '#4ade80' : '#cbd5e1'}
-                    />
-                    <Text
-                      style={[
-                        styles.episodePillText,
-                        watched && styles.episodePillTextWatched,
-                      ]}
-                      numberOfLines={1}
+                    <TouchableOpacity
+                      style={styles.episodeMainTap}
+                      onPress={() => {
+                        setOfflineQueue([]);
+                        void openServerPickerForUrl(
+                          ep.url,
+                          `${result.metadata.title} - ${ep.title}`,
+                          ep.thumbnail || result.metadata.poster,
+                        );
+                      }}
+                      onLongPress={() => {
+                        void toggleEpisodeWatched(ep.url).then(setWatchedUrls);
+                      }}
+                      activeOpacity={0.75}
                     >
-                      {ep.title}
-                    </Text>
-                  </TouchableOpacity>
+                      <Ionicons
+                        name={watched ? 'checkmark-circle' : 'play-circle-outline'}
+                        size={22}
+                        color={watched ? '#4ade80' : '#cbd5e1'}
+                      />
+                      <Text
+                        style={[
+                          styles.episodePillText,
+                          watched && styles.episodePillTextWatched,
+                        ]}
+                        numberOfLines={1}
+                      >
+                        {ep.title}
+                      </Text>
+                    </TouchableOpacity>
+
+                    <TouchableOpacity
+                      style={[
+                        styles.episodeDownloadBtn,
+                        activeDl && styles.episodeDownloadBtnActive,
+                        savedDl && styles.episodeDownloadBtnDone,
+                      ]}
+                      onPress={() =>
+                        void handleStartDownload({
+                          episodeUrl: ep.url,
+                          episodeTitle: ep.title,
+                          episodeNumber: extractNumericOrder(ep),
+                          animeUrl: result.metadata.sourceUrl,
+                          animeTitle: result.metadata.title,
+                          animeThumbnail: result.metadata.poster || ep.thumbnail,
+                        })
+                      }
+                      hitSlop={{ top: 8, bottom: 8, left: 6, right: 8 }}
+                      activeOpacity={0.75}
+                    >
+                      {activeDl ? (
+                        <View style={styles.epDlProgressRow}>
+                          <ActivityIndicator size="small" color="#c7d2fe" />
+                          <Text style={styles.epDlProgressText}>
+                            {activeDl.phase === 'resolving'
+                              ? '...'
+                              : activeDl.phase === 'preparing'
+                                ? `${activeDl.progress}%`
+                                : `${activeDl.progress}%`}
+                          </Text>
+                        </View>
+                      ) : savedDl ? (
+                        <Ionicons name="cloud-done" size={19} color="#34d399" />
+                      ) : (
+                        <Ionicons name="download-outline" size={19} color="#cbd5e1" />
+                      )}
+                    </TouchableOpacity>
+                  </View>
                 );
               })}
             </View>
@@ -1840,6 +2182,267 @@ function MainScreen() {
     </ScrollView>
   );
 
+  const renderDownloadsTab = () => {
+    const selectedGroup = selectedDownloadAnimeKey
+      ? groupedDownloads.find((g) => g.animeKey === selectedDownloadAnimeKey) ?? null
+      : null;
+
+    if (selectedGroup) {
+      const posterUri = selectedGroup.thumbnailUri
+        ? selectedGroup.thumbnailUri
+        : selectedGroup.remoteThumbnail
+          ? buildProxyUrl(backendUrl, selectedGroup.remoteThumbnail, undefined, accessPin)
+          : undefined;
+      const nextToPlay =
+        selectedGroup.episodes.find((ep) => !watchedUrls.includes(ep.episodeUrl)) ??
+        selectedGroup.episodes[0];
+
+      return (
+        <ScrollView
+          style={styles.flex1}
+          contentContainerStyle={[styles.tabPageContent, isWide && styles.wideContainer]}
+        >
+          <View style={styles.dlFolderTopBar}>
+            <TouchableOpacity
+              onPress={() => setSelectedDownloadAnimeKey(null)}
+              style={styles.backPillBtn}
+            >
+              <Ionicons name="arrow-back" size={18} color="#f1f5f9" />
+              <Text style={styles.backPillText}>Descargas</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.dlDeleteAllBtn}
+              onPress={() =>
+                handleDeleteDownloadedAnime(selectedGroup.animeKey, selectedGroup.animeTitle)
+              }
+            >
+              <Ionicons name="trash-outline" size={16} color="#fca5a5" />
+              <Text style={styles.dlDeleteAllText}>Borrar todo</Text>
+            </TouchableOpacity>
+          </View>
+
+          <View style={styles.dlAnimeBanner}>
+            {posterUri ? (
+              <Image source={{ uri: posterUri }} style={styles.dlBannerPoster} resizeMode="cover" />
+            ) : (
+              <View style={[styles.dlBannerPoster, styles.posterPlaceholder]}>
+                <Ionicons name="film-outline" size={28} color="#71717a" />
+              </View>
+            )}
+            <View style={styles.dlBannerInfo}>
+              <Text style={styles.dlBannerTitle} numberOfLines={2}>
+                {selectedGroup.animeTitle}
+              </Text>
+              <Text style={styles.dlBannerMeta}>
+                {selectedGroup.episodes.length}{' '}
+                {selectedGroup.episodes.length === 1 ? 'episodio' : 'episodios'} •{' '}
+                {formatBytes(selectedGroup.totalSizeBytes)}
+              </Text>
+              {nextToPlay && (
+                <TouchableOpacity
+                  style={styles.dlQuickPlayBtn}
+                  onPress={() => playOfflineEpisode(nextToPlay, selectedGroup.episodes)}
+                >
+                  <Ionicons name="play" size={15} color="#ffffff" />
+                  <Text style={styles.dlQuickPlayText} numberOfLines={1}>
+                    Reproducir {nextToPlay.episodeTitle}
+                  </Text>
+                </TouchableOpacity>
+              )}
+            </View>
+          </View>
+
+          <Text style={styles.tabSectionLabel}>EPISODIOS DESCARGADOS (OFFLINE)</Text>
+          <View style={styles.episodesList}>
+            {selectedGroup.episodes.map((ep) => {
+              const watched = watchedUrls.includes(ep.episodeUrl);
+              return (
+                <View
+                  key={ep.id}
+                  style={[styles.episodePill, watched && styles.episodePillWatched]}
+                >
+                  <TouchableOpacity
+                    style={styles.episodeMainTap}
+                    onPress={() => playOfflineEpisode(ep, selectedGroup.episodes)}
+                    activeOpacity={0.75}
+                  >
+                    <Ionicons
+                      name={watched ? 'checkmark-circle' : 'play-circle'}
+                      size={23}
+                      color={watched ? '#4ade80' : '#818cf8'}
+                    />
+                    <View style={styles.flex1}>
+                      <Text
+                        style={[
+                          styles.episodePillText,
+                          watched && styles.episodePillTextWatched,
+                        ]}
+                        numberOfLines={1}
+                      >
+                        {ep.episodeTitle}
+                      </Text>
+                      <Text style={styles.dlEpisodeSubMeta}>
+                        {formatBytes(ep.sizeBytes)} • Listo sin internet
+                      </Text>
+                    </View>
+                  </TouchableOpacity>
+
+                  <View style={styles.dlEpisodeActions}>
+                    <TouchableOpacity
+                      style={styles.dlMiniIconBtn}
+                      onPress={() => void handleShareDownloadedEpisode(ep)}
+                      hitSlop={{ top: 8, bottom: 8, left: 6, right: 6 }}
+                    >
+                      <Ionicons name="share-outline" size={18} color="#cbd5e1" />
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={styles.dlMiniIconBtn}
+                      onPress={() => handleDeleteDownloadedEpisode(ep)}
+                      hitSlop={{ top: 8, bottom: 8, left: 6, right: 6 }}
+                    >
+                      <Ionicons name="trash-outline" size={18} color="#f87171" />
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              );
+            })}
+          </View>
+        </ScrollView>
+      );
+    }
+
+    const totalSize = downloads.reduce((acc, d) => acc + d.sizeBytes, 0);
+
+    return (
+      <ScrollView
+        style={styles.flex1}
+        contentContainerStyle={[styles.tabPageContent, isWide && styles.wideContainer]}
+      >
+        <View style={styles.tabPageHeader}>
+          <Text style={styles.tabPageTitle}>Descargas</Text>
+          {downloads.length > 0 && (
+            <View style={styles.dlStorageBadge}>
+              <Ionicons name="folder-outline" size={13} color="#a5b4fc" />
+              <Text style={styles.dlStorageBadgeText}>
+                {downloads.length} {downloads.length === 1 ? 'ep.' : 'eps.'} • {formatBytes(totalSize)}
+              </Text>
+            </View>
+          )}
+        </View>
+
+        {activeDownloadsList.length > 0 && (
+          <View style={styles.dlActiveSection}>
+            <Text style={styles.tabSectionLabel}>DESCARGANDO AHORA</Text>
+            {activeDownloadsList.map((act) => {
+              const phaseLabel =
+                act.phase === 'resolving'
+                  ? 'Buscando servidor...'
+                  : act.phase === 'preparing'
+                    ? `Preparando MP4 (${act.progress}%)...`
+                    : act.totalBytes
+                      ? `Descargando ${act.progress}% (${formatBytes(act.bytesWritten ?? 0)} / ${formatBytes(act.totalBytes)})`
+                      : `Descargando ${act.progress}%...`;
+              return (
+                <View key={act.episodeUrl} style={styles.dlActiveCard}>
+                  <View style={styles.dlActiveHeader}>
+                    <View style={styles.flex1}>
+                      <Text style={styles.dlActiveAnime} numberOfLines={1}>
+                        {act.animeTitle}
+                      </Text>
+                      <Text style={styles.dlActiveEp} numberOfLines={1}>
+                        {act.episodeTitle} • {phaseLabel}
+                      </Text>
+                    </View>
+                    <TouchableOpacity
+                      style={styles.dlCancelBtn}
+                      onPress={() => handleCancelDownload(act.episodeUrl)}
+                    >
+                      <Ionicons name="close" size={18} color="#fca5a5" />
+                    </TouchableOpacity>
+                  </View>
+                  <View style={styles.dlProgressTrack}>
+                    <View
+                      style={[
+                        styles.dlProgressFill,
+                        { width: `${Math.max(4, Math.min(100, act.progress))}%` },
+                      ]}
+                    />
+                  </View>
+                </View>
+              );
+            })}
+          </View>
+        )}
+
+        {groupedDownloads.length === 0 ? (
+          <View style={styles.centerBox}>
+            <Ionicons name="cloud-download-outline" size={46} color="#52525b" />
+            <Text style={styles.mutedText}>
+              Todavía no tienes episodios descargados.{'\n'}Pulsa el botón de descarga a la derecha
+              de cualquier capítulo para guardarlo organizado por anime y verlo sin internet.
+            </Text>
+          </View>
+        ) : (
+          <View style={{ gap: 10 }}>
+            <Text style={styles.tabSectionLabel}>
+              CLASIFICADOS POR ANIME ({groupedDownloads.length})
+            </Text>
+            {groupedDownloads.map((group) => {
+              const posterUri = group.thumbnailUri
+                ? group.thumbnailUri
+                : group.remoteThumbnail
+                  ? buildProxyUrl(backendUrl, group.remoteThumbnail, undefined, accessPin)
+                  : undefined;
+              return (
+                <TouchableOpacity
+                  key={group.animeKey}
+                  style={styles.dlAnimeCard}
+                  onPress={() => setSelectedDownloadAnimeKey(group.animeKey)}
+                  activeOpacity={0.82}
+                >
+                  {posterUri ? (
+                    <Image
+                      source={{ uri: posterUri }}
+                      style={styles.dlAnimePoster}
+                      resizeMode="cover"
+                    />
+                  ) : (
+                    <View style={[styles.dlAnimePoster, styles.posterPlaceholder]}>
+                      <Ionicons name="folder" size={26} color="#818cf8" />
+                    </View>
+                  )}
+                  <View style={styles.flex1}>
+                    <Text style={styles.dlAnimeTitle} numberOfLines={2}>
+                      {group.animeTitle}
+                    </Text>
+                    <View style={styles.dlAnimeMetaRow}>
+                      <View style={styles.dlCountPill}>
+                        <Ionicons name="film-outline" size={12} color="#c7d2fe" />
+                        <Text style={styles.dlCountPillText}>
+                          {group.episodes.length}{' '}
+                          {group.episodes.length === 1 ? 'episodio' : 'episodios'}
+                        </Text>
+                      </View>
+                      <Text style={styles.dlAnimeSize}>{formatBytes(group.totalSizeBytes)}</Text>
+                    </View>
+                  </View>
+                  <TouchableOpacity
+                    style={styles.dlMiniIconBtn}
+                    onPress={() => handleDeleteDownloadedAnime(group.animeKey, group.animeTitle)}
+                    hitSlop={{ top: 8, bottom: 8, left: 6, right: 6 }}
+                  >
+                    <Ionicons name="trash-outline" size={18} color="#f87171" />
+                  </TouchableOpacity>
+                  <Ionicons name="chevron-forward" size={20} color="#94a3b8" />
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+        )}
+      </ScrollView>
+    );
+  };
+
   const renderSavedListTab = (mode: 'favorites' | 'history') => {
     const rawList = mode === 'favorites' ? favorites : history;
     const q = savedSearchQuery.trim().toLowerCase();
@@ -1988,27 +2591,49 @@ function MainScreen() {
               ? renderGenericView()
               : renderCatalogView())}
         {bottomTab === 'servers' && renderServersTab()}
+        {bottomTab === 'downloads' && renderDownloadsTab()}
         {bottomTab === 'favorites' && renderSavedListTab('favorites')}
         {bottomTab === 'history' && renderSavedListTab('history')}
+
+        {downloadToast && (
+          <View style={styles.toastBanner} pointerEvents="none">
+            <Ionicons name="download-outline" size={16} color="#a5b4fc" />
+            <Text style={styles.toastBannerText} numberOfLines={2}>
+              {downloadToast}
+            </Text>
+          </View>
+        )}
       </View>
 
       {/* Bottom Navigation Bar */}
       <SafeAreaView edges={['bottom']} style={styles.bottomBar}>
         {(
-          [
-            { key: 'home', icon: 'home', label: 'Inicio' },
-            { key: 'servers', icon: 'extension-puzzle', label: 'Servers' },
-            { key: 'favorites', icon: 'heart', label: 'Favoritos' },
-            { key: 'history', icon: 'time', label: 'Historial' },
-          ] as { key: BottomTab; icon: keyof typeof Ionicons.glyphMap; label: string }[]
+          (Platform.OS === 'web'
+            ? [
+                { key: 'home', icon: 'home', label: 'Inicio' },
+                { key: 'servers', icon: 'extension-puzzle', label: 'Servers' },
+                { key: 'favorites', icon: 'heart', label: 'Favoritos' },
+                { key: 'history', icon: 'time', label: 'Historial' },
+              ]
+            : [
+                { key: 'home', icon: 'home', label: 'Inicio' },
+                { key: 'servers', icon: 'extension-puzzle', label: 'Servers' },
+                { key: 'downloads', icon: 'download', label: 'Descargas' },
+                { key: 'favorites', icon: 'heart', label: 'Favoritos' },
+                { key: 'history', icon: 'time', label: 'Historial' },
+              ]) as { key: BottomTab; icon: keyof typeof Ionicons.glyphMap; label: string }[]
         ).map((tab) => {
           const active = bottomTab === tab.key;
+          const showActiveBadge = tab.key === 'downloads' && activeDownloadsList.length > 0;
           return (
             <TouchableOpacity
               key={tab.key}
               style={styles.bottomTabBtn}
               onPress={() => {
                 if (tab.key !== bottomTab) setSavedSearchQuery('');
+                if (tab.key === 'downloads' && bottomTab === 'downloads') {
+                  setSelectedDownloadAnimeKey(null);
+                }
                 setBottomTab(tab.key);
               }}
             >
@@ -2018,6 +2643,11 @@ function MainScreen() {
                   size={21}
                   color={active ? '#e0e7ff' : '#94a3b8'}
                 />
+                {showActiveBadge && (
+                  <View style={styles.bottomBadgeDot}>
+                    <Text style={styles.bottomBadgeText}>{activeDownloadsList.length}</Text>
+                  </View>
+                )}
               </View>
               <Text style={[styles.bottomLabel, active && styles.bottomLabelActive]}>
                 {tab.label}
@@ -2143,6 +2773,7 @@ function MainScreen() {
         }}
         onClose={() => {
           setSelectedItem(null);
+          setOfflineQueue([]);
           void refreshContinueWatching();
         }}
       />
@@ -2582,11 +3213,50 @@ const styles = StyleSheet.create({
   episodePill: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 12,
+    justifyContent: 'space-between',
+    gap: 8,
     backgroundColor: '#2a2d3a',
-    paddingHorizontal: 16,
-    paddingVertical: 14,
+    paddingLeft: 16,
+    paddingRight: 10,
+    paddingVertical: 8,
     borderRadius: 28,
+  },
+  episodeMainTap: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingVertical: 6,
+  },
+  episodeDownloadBtn: {
+    minWidth: 38,
+    height: 36,
+    paddingHorizontal: 9,
+    borderRadius: 18,
+    backgroundColor: 'rgba(15, 23, 42, 0.45)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  episodeDownloadBtnActive: {
+    backgroundColor: 'rgba(99, 102, 241, 0.28)',
+    borderWidth: 1,
+    borderColor: 'rgba(129, 140, 248, 0.55)',
+  },
+  episodeDownloadBtnDone: {
+    backgroundColor: 'rgba(16, 185, 129, 0.16)',
+    borderWidth: 1,
+    borderColor: 'rgba(52, 211, 153, 0.35)',
+  },
+  epDlProgressRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+  },
+  epDlProgressText: {
+    color: '#e0e7ff',
+    fontSize: 11,
+    fontWeight: '700',
+    fontVariant: ['tabular-nums'],
   },
   episodePillText: {
     flex: 1,
@@ -3106,5 +3776,277 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '600',
     lineHeight: 15,
+  },
+  detailActionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginHorizontal: 16,
+    marginTop: 14,
+  },
+  watchNowFlex: {
+    flex: 1,
+    marginHorizontal: 0,
+    marginTop: 0,
+  },
+  downloadMovieBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    backgroundColor: '#232634',
+    borderWidth: 1,
+    borderColor: '#3b405a',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderRadius: 14,
+  },
+  downloadMovieBtnDone: {
+    backgroundColor: 'rgba(16, 185, 129, 0.14)',
+    borderColor: 'rgba(52, 211, 153, 0.45)',
+  },
+  downloadMovieBtnText: {
+    color: '#e0e7ff',
+    fontSize: 13.5,
+    fontWeight: '700',
+  },
+  dlStorageBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    backgroundColor: '#1e212d',
+    borderWidth: 1,
+    borderColor: '#2d3142',
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 14,
+  },
+  dlStorageBadgeText: {
+    color: '#c7d2fe',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  dlActiveSection: {
+    gap: 8,
+    marginBottom: 14,
+  },
+  dlActiveCard: {
+    backgroundColor: '#1e212d',
+    borderRadius: 14,
+    padding: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(99, 102, 241, 0.4)',
+    gap: 8,
+  },
+  dlActiveHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  dlActiveAnime: {
+    color: '#f8fafc',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  dlActiveEp: {
+    color: '#94a3b8',
+    fontSize: 12,
+    marginTop: 2,
+  },
+  dlCancelBtn: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    backgroundColor: 'rgba(239, 68, 68, 0.16)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  dlProgressTrack: {
+    height: 5,
+    borderRadius: 3,
+    backgroundColor: 'rgba(255,255,255,0.12)',
+    overflow: 'hidden',
+  },
+  dlProgressFill: {
+    height: '100%',
+    borderRadius: 3,
+    backgroundColor: '#818cf8',
+  },
+  dlAnimeCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    backgroundColor: '#1e212d',
+    borderRadius: 16,
+    padding: 10,
+    borderWidth: 1,
+    borderColor: '#2d3142',
+  },
+  dlAnimePoster: {
+    width: 58,
+    height: 82,
+    borderRadius: 10,
+    backgroundColor: '#252938',
+  },
+  dlAnimeTitle: {
+    color: '#f8fafc',
+    fontSize: 15,
+    fontWeight: '700',
+    lineHeight: 20,
+  },
+  dlAnimeMetaRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginTop: 6,
+  },
+  dlCountPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: 'rgba(99, 102, 241, 0.2)',
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 10,
+  },
+  dlCountPillText: {
+    color: '#c7d2fe',
+    fontSize: 11.5,
+    fontWeight: '700',
+  },
+  dlAnimeSize: {
+    color: '#94a3b8',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  dlFolderTopBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 12,
+  },
+  dlDeleteAllBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    paddingHorizontal: 11,
+    paddingVertical: 7,
+    borderRadius: 14,
+    backgroundColor: 'rgba(239, 68, 68, 0.14)',
+    borderWidth: 1,
+    borderColor: 'rgba(248, 113, 113, 0.35)',
+  },
+  dlDeleteAllText: {
+    color: '#fca5a5',
+    fontSize: 12.5,
+    fontWeight: '600',
+  },
+  dlAnimeBanner: {
+    flexDirection: 'row',
+    gap: 14,
+    backgroundColor: '#1e212d',
+    borderRadius: 16,
+    padding: 12,
+    borderWidth: 1,
+    borderColor: '#2d3142',
+    marginBottom: 18,
+  },
+  dlBannerPoster: {
+    width: 74,
+    height: 106,
+    borderRadius: 10,
+    backgroundColor: '#252938',
+  },
+  dlBannerInfo: {
+    flex: 1,
+    justifyContent: 'center',
+    gap: 6,
+  },
+  dlBannerTitle: {
+    color: '#f8fafc',
+    fontSize: 16.5,
+    fontWeight: '700',
+    lineHeight: 21,
+  },
+  dlBannerMeta: {
+    color: '#94a3b8',
+    fontSize: 12.5,
+    fontWeight: '600',
+  },
+  dlQuickPlayBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    alignSelf: 'flex-start',
+    gap: 6,
+    backgroundColor: '#4f46e5',
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: 12,
+    marginTop: 2,
+  },
+  dlQuickPlayText: {
+    color: '#ffffff',
+    fontSize: 12.5,
+    fontWeight: '700',
+  },
+  dlEpisodeSubMeta: {
+    color: '#94a3b8',
+    fontSize: 11.5,
+    marginTop: 2,
+  },
+  dlEpisodeActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+  },
+  dlMiniIconBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: 'rgba(15, 23, 42, 0.45)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  bottomBadgeDot: {
+    position: 'absolute',
+    top: -3,
+    right: -4,
+    minWidth: 16,
+    height: 16,
+    borderRadius: 8,
+    backgroundColor: '#4f46e5',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 3,
+  },
+  bottomBadgeText: {
+    color: '#ffffff',
+    fontSize: 10,
+    fontWeight: '800',
+  },
+  toastBanner: {
+    position: 'absolute',
+    left: 16,
+    right: 16,
+    bottom: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: 'rgba(20, 23, 36, 0.96)',
+    borderWidth: 1,
+    borderColor: '#4f46e5',
+    borderRadius: 14,
+    paddingHorizontal: 14,
+    paddingVertical: 11,
+    shadowColor: '#000',
+    shadowOpacity: 0.4,
+    shadowRadius: 10,
+    elevation: 8,
+  },
+  toastBannerText: {
+    flex: 1,
+    color: '#f1f5f9',
+    fontSize: 13,
+    fontWeight: '600',
   },
 });

@@ -1,17 +1,19 @@
 mod adapters;
+mod download;
 mod proxy;
 mod search;
 mod types;
 mod url_utils;
 mod video_resolver;
 
+use crate::download::DownloadManager;
 use crate::types::{ExtractionResult, MediaItem, MediaType, PageMetadata, ResolvedVideo};
 use crate::url_utils::{extract_filename, make_media_id, validate_target_url};
-use axum::extract::{Query, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use moka::future::Cache;
 use reqwest::Client;
@@ -33,6 +35,7 @@ struct AppState {
     extract_cache: Cache<String, ExtractionResult>,
     resolve_cache: Cache<String, ResolvedVideo>,
     access_pin: Arc<String>,
+    download_manager: DownloadManager,
 }
 
 async fn security_headers_mw(req: Request, next: Next) -> Response {
@@ -371,6 +374,44 @@ async fn proxy_route_handler(
     proxy::proxy_handler(State(state.client), headers, query).await
 }
 
+async fn direct_download_route_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    query: Query<download::DirectDownloadQuery>,
+) -> Response {
+    download::direct_download_handler(state.client, state.download_manager, headers, query).await
+}
+
+async fn start_download_job_route_handler(
+    State(state): State<AppState>,
+    body: Json<download::StartDownloadJobBody>,
+) -> Response {
+    download::start_download_job_handler(State(state.download_manager), body).await
+}
+
+async fn download_job_status_route_handler(
+    State(state): State<AppState>,
+    path: Path<String>,
+) -> Response {
+    download::download_job_status_handler(State(state.download_manager), path).await
+}
+
+async fn cancel_download_job_route_handler(
+    State(state): State<AppState>,
+    path: Path<String>,
+) -> Response {
+    download::cancel_download_job_handler(State(state.download_manager), path).await
+}
+
+async fn download_job_file_route_handler(
+    State(state): State<AppState>,
+    path: Path<String>,
+    headers: axum::http::HeaderMap,
+    query: Query<download::JobFileQuery>,
+) -> Response {
+    download::download_job_file_handler(State(state.download_manager), path, headers, query).await
+}
+
 fn find_public_dir() -> Option<PathBuf> {
     if let Ok(env_dir) = std::env::var("PUBLIC_DIR") {
         let p = PathBuf::from(env_dir);
@@ -419,11 +460,15 @@ async fn main() {
         .time_to_live(Duration::from_secs(2 * 60))
         .build();
 
+    let access_pin_arc = Arc::new(access_pin);
+    let download_manager = DownloadManager::new(port, access_pin_arc.clone());
+
     let state = AppState {
         client,
         extract_cache,
         resolve_cache,
-        access_pin: Arc::new(access_pin),
+        access_pin: access_pin_arc,
+        download_manager,
     };
 
     // JSON API routes WITH gzip compression
@@ -433,15 +478,26 @@ async fn main() {
         .route("/search", get(search_handler))
         .route("/resolve", get(resolve_handler))
         .route("/resolve-batch", post(resolve_batch_handler))
+        .route("/download-job", post(start_download_job_route_handler))
+        .route(
+            "/download-job/{id}/status",
+            get(download_job_status_route_handler),
+        )
+        .route("/download-job/{id}", delete(cancel_download_job_route_handler))
         .layer(CompressionLayer::new())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_access_pin_mw,
         ));
 
-    // Streaming proxy route WITHOUT CompressionLayer (zero-copy raw binary video/HLS/images!)
+    // Streaming proxy & download routes WITHOUT CompressionLayer (zero-copy raw binary video/HLS/images!)
     let protected_proxy = Router::new()
         .route("/proxy", get(proxy_route_handler))
+        .route("/download", get(direct_download_route_handler))
+        .route(
+            "/download-job/{id}/file",
+            get(download_job_file_route_handler),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_access_pin_mw,
@@ -578,5 +634,18 @@ mod tests {
         let s_exact = search::score_title("acción spider man", "Accion Spider-Man");
         let s_partial = search::score_title("acción spider man", "El hombre araña");
         assert!(s_exact > s_partial);
+    }
+
+    #[test]
+    fn test_download_filename_and_ffmpeg_duration_parsing() {
+        let clean = download::sanitize_download_filename(Some("Jujutsu Kaisen: S2 / Capítulo 21?"));
+        assert_eq!(clean, "Jujutsu Kaisen S2 Capítulo 21.mp4");
+
+        let disp = download::build_content_disposition(&clean);
+        assert!(disp.contains("attachment;"));
+        assert!(disp.contains("filename*=UTF-8''"));
+
+        let dur = download::parse_ffmpeg_duration_us("  Duration: 00:24:10.50, start: 0.000000");
+        assert_eq!(dur, Some(1_450_500_000));
     }
 }

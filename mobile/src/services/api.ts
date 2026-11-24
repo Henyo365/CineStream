@@ -243,3 +243,108 @@ export async function resolveVideoBatch(
     return {};
   }
 }
+
+export interface DownloadJobStatus {
+  jobId: string;
+  status: 'preparing' | 'ready' | 'error';
+  progress: number;
+  sizeBytes?: number;
+  filename: string;
+  error?: string;
+}
+
+export function buildDirectDownloadUrl(
+  backendUrl: string,
+  streamUrl: string,
+  filename: string,
+  referer?: string,
+  pin?: string,
+): string {
+  const base = normalizeBackendUrl(backendUrl);
+  const params = new URLSearchParams({
+    url: streamUrl,
+    filename,
+  });
+  if (referer) params.set('referer', referer);
+  if (pin) params.set('pin', pin);
+  return `${base}/api/download?${params.toString()}`;
+}
+
+export async function startDownloadJob(
+  backendUrl: string,
+  streamUrl: string,
+  filename: string,
+  referer?: string,
+  pin?: string,
+): Promise<DownloadJobStatus> {
+  const base = normalizeBackendUrl(backendUrl);
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (pin) headers['x-access-pin'] = pin;
+
+  const res = await fetchWithTimeout(
+    `${base}/api/download-job`,
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ url: streamUrl, referer, filename }),
+    },
+    20_000,
+  );
+  const data = await parseJsonSafe<DownloadJobStatus & { error?: string }>(res);
+  if (!res.ok || !data?.jobId) {
+    throw new Error(data?.error || `No se pudo iniciar la preparación (${res.status})`);
+  }
+  return data;
+}
+
+export async function getDownloadJobStatus(
+  backendUrl: string,
+  jobId: string,
+  pin?: string,
+): Promise<DownloadJobStatus> {
+  const base = normalizeBackendUrl(backendUrl);
+  const headers: Record<string, string> = {};
+  if (pin) headers['x-access-pin'] = pin;
+
+  const res = await fetchWithTimeout(
+    `${base}/api/download-job/${encodeURIComponent(jobId)}/status`,
+    { method: 'GET', headers },
+    15_000,
+  );
+  const data = await parseJsonSafe<DownloadJobStatus & { error?: string }>(res);
+  if (!res.ok || !data) {
+    throw new Error(data?.error || `Error consultando progreso (${res.status})`);
+  }
+  return data;
+}
+
+export async function cancelDownloadJob(
+  backendUrl: string,
+  jobId: string,
+  pin?: string,
+): Promise<void> {
+  const base = normalizeBackendUrl(backendUrl);
+  const headers: Record<string, string> = {};
+  if (pin) headers['x-access-pin'] = pin;
+  try {
+    await fetchWithTimeout(
+      `${base}/api/download-job/${encodeURIComponent(jobId)}`,
+      { method: 'DELETE', headers },
+      8_000,
+    );
+  } catch {
+    // ignore cleanup errors
+  }
+}
+
+export function buildDownloadJobFileUrl(
+  backendUrl: string,
+  jobId: string,
+  filename: string,
+  pin?: string,
+): string {
+  const base = normalizeBackendUrl(backendUrl);
+  const params = new URLSearchParams({ filename });
+  if (pin) params.set('pin', pin);
+  return `${base}/api/download-job/${encodeURIComponent(jobId)}/file?${params.toString()}`;
+}
