@@ -78,10 +78,19 @@ app.get('/api/search', requireAccessPin, async (req, res) => {
   }
 
   const encoded = encodeURIComponent(q);
-  const sources = [
-    { name: 'AnimeFLV', url: `https://animeflv.or.at/?s=${encoded}` },
-    { name: 'Hackstore', url: `https://www.hackstore.fo/?s=${encoded}` },
+  const filter = typeof req.query.source === 'string' ? req.query.source.toLowerCase() : 'all';
+  const allSources = [
+    { key: 'animeflv', name: 'AnimeFLV', url: `https://animeflv.or.at/?s=${encoded}` },
+    { key: 'jkanime', name: 'JKAnime', url: `https://jkanime.net/buscar/${encoded}/` },
+    { key: 'hackstore', name: 'Hackstore', url: `https://www.hackstore.fo/?s=${encoded}` },
+    {
+      key: 'leercapitulo',
+      name: 'LeerCapitulo',
+      url: `https://www.leercapitulo.co/manga/?q=${encoded}`,
+    },
   ];
+  const sources =
+    filter === 'all' ? allSources : allSources.filter((s) => s.key === filter);
 
   const settled = await Promise.allSettled(
     sources.map(async (src) => {

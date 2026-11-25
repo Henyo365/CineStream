@@ -59,10 +59,29 @@ where
             format!("https://animeflv.or.at/?s={encoded}"),
         ));
     }
+    if filter == "all" || filter == "jkanime" {
+        targets.push((
+            "JKAnime",
+            format!("https://jkanime.net/buscar/{encoded}/"),
+        ));
+    }
     if filter == "all" || filter == "hackstore" {
         targets.push((
             "Hackstore",
             format!("https://www.hackstore.fo/?s={encoded}"),
+        ));
+    }
+    if filter == "all" || filter == "leercapitulo" {
+        targets.push((
+            "LeerCapitulo",
+            format!("https://www.leercapitulo.co/manga/?q={encoded}"),
+        ));
+    }
+    if filter == "ext_comic" {
+        let dom = crate::adapters::ext_comic::vault_domain();
+        targets.push((
+            "TMO",
+            format!("https://{dom}/biblioteca?title={encoded}"),
         ));
     }
 

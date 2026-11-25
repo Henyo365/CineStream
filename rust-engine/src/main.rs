@@ -648,4 +648,92 @@ mod tests {
         let dur = download::parse_ffmpeg_duration_us("  Duration: 00:24:10.50, start: 0.000000");
         assert_eq!(dur, Some(1_450_500_000));
     }
+
+    #[test]
+    fn test_jkanime_adapter_detail_and_episode_servers() {
+        let detail_url = Url::parse("https://jkanime.net/black-clover-2nd-season/").unwrap();
+        let detail_html = r#"<html><body>
+            <div class="anime__details__content">
+                <div class="anime_pic"><img src="https://cdn.jkdesa.com/assets/images/animes/image/bc2.jpg" /></div>
+                <div class="anime_info">
+                    <h3>Black Clover 2nd Season</h3>
+                    <p class="scroll">Segunda temporada de Black Clover.</p>
+                </div>
+                <div class="anime_data">
+                    <ul>
+                        <li><span>Generos:</span> <a href="https://jkanime.net/genero/accion/">Accion</a></li>
+                        <li><span>Estado:</span> En emision</li>
+                        <li><span>Puntuación:</span> 8.89</li>
+                        <li><span>Episodios:</span> 0</li>
+                    </ul>
+                </div>
+                <a href="https://jkanime.net/black-clover-2nd-season/7/" id="uep">Black Clover - 7</a>
+            </div>
+        </body></html>"#;
+        let detail_res = adapters::extract_from_html(&detail_url, detail_html);
+        assert_eq!(detail_res.adapter, "jkanime");
+        assert_eq!(detail_res.metadata.title, "Black Clover 2nd Season");
+        assert_eq!(detail_res.metadata.rating.as_deref(), Some("8.89"));
+        assert_eq!(detail_res.pages.len(), 7);
+        assert_eq!(detail_res.pages[0].title, "Capítulo 7");
+
+        let voe_b64 = STANDARD.encode("https://voe.sx/e/abc123xyz");
+        let ep_url = Url::parse("https://jkanime.net/black-clover-2nd-season/7/").unwrap();
+        let ep_html = format!(
+            r#"<html><body>
+                <div id="marcar_visto" data-anime="black-clover-2nd-season" data-title="Black Clover 2nd Season" data-numero="7"></div>
+                <script>
+                    var jkdefault = "https://cdn.jkdesa.com/assets/images/animes/image/bc2.jpg";
+                    var video = [];
+                    video[1] = '<iframe class="player_conte" src="https://jkanime.net/jkplayer/umv?e=XYZ" width="565" height="318"></iframe>';
+                    var servers = [{{"remote":"{voe_b64}","server":"VOE","lang":1}}];
+                </script>
+            </body></html>"#
+        );
+        let ep_res = adapters::extract_from_html(&ep_url, &ep_html);
+        assert_eq!(ep_res.adapter, "jkanime");
+        assert_eq!(ep_res.videos.len(), 2);
+        assert_eq!(
+            ep_res.metadata.info_url.as_deref(),
+            Some("https://jkanime.net/black-clover-2nd-season/")
+        );
+    }
+
+    #[test]
+    fn test_leercapitulo_and_hidden_vault_adapters() {
+        let chap_url =
+            Url::parse("https://www.leercapitulo.co/leer/3qiyyebta7/fairy-tail/225/").unwrap();
+        let chap_html = r#"<html><body class="lc-reader">
+            <a class="lc-rbtn lc-rbtn--title" href="/manga/3qiyyebta7/fairy-tail/">‹ FAIRY TAIL</a>
+            <select id="chapterSelect">
+                <option value="/leer/3qiyyebta7/fairy-tail/225/" selected>Capitulo 225</option>
+                <option value="/leer/3qiyyebta7/fairy-tail/224/">Capitulo 224</option>
+            </select>
+            <main class="lc-pages" id="lcPages">
+                <img data-src="https://cdn.example.com/p1.jpg" />
+                <img data-src="https://cdn.example.com/p2.jpg" />
+            </main>
+        </body></html>"#;
+        let lc_res = adapters::extract_from_html(&chap_url, chap_html);
+        assert_eq!(lc_res.adapter, "leercapitulo");
+        assert_eq!(lc_res.images.len(), 2);
+        assert_eq!(lc_res.images[0].source_tag.as_deref(), Some("manga-page"));
+        assert_eq!(lc_res.pages.len(), 2);
+
+        // Ensure hidden vault is NOT advertised in /health adapters list
+        assert!(!adapters::list_adapters().contains(&"ext-comic"));
+        let dom = adapters::ext_comic::vault_domain();
+        let vault_url = Url::parse(&format!("https://{dom}/view_uploads/21972")).unwrap();
+        let vault_html = r#"<html><body>
+            <a href="/library/comic/21972/test-work" class="tb-back">Back</a>
+            <div class="tb-title">Test Work</div>
+            <div id="reader-wrap">
+                <div class="reader-img-wrap"><img data-src="https://cdn.example.com/1.webp" /></div>
+                <div class="reader-img-wrap"><img data-src="https://cdn.example.com/2.webp" /></div>
+            </div>
+        </body></html>"#;
+        let v_res = adapters::extract_from_html(&vault_url, vault_html);
+        assert_eq!(v_res.adapter, "ext-comic");
+        assert_eq!(v_res.images.len(), 2);
+    }
 }

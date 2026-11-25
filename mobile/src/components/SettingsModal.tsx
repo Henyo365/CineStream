@@ -11,11 +11,14 @@ import {
 } from 'react-native';
 import { checkBackendHealth, type BackendHealthResult } from '../services/api';
 import { DEFAULT_BACKEND_URL } from '../services/storage';
+import { verifyVaultCode } from '../sources';
 
 interface SettingsModalProps {
   visible: boolean;
   currentUrl: string;
   currentPin?: string;
+  vaultUnlocked?: boolean;
+  onToggleVault?: (unlock: boolean) => void;
   onSave: (newUrl: string, newPin: string) => void;
   onClose: () => void;
 }
@@ -33,6 +36,8 @@ export function SettingsModal({
   visible,
   currentUrl,
   currentPin = '',
+  vaultUnlocked = false,
+  onToggleVault,
   onSave,
   onClose,
 }: SettingsModalProps) {
@@ -41,6 +46,9 @@ export function SettingsModal({
   const [showPin, setShowPin] = useState(false);
   const [testing, setTesting] = useState(false);
   const [health, setHealth] = useState<BackendHealthResult | null>(null);
+  const [secretTapCount, setSecretTapCount] = useState(0);
+  const [diagOpen, setDiagOpen] = useState(false);
+  const [diagInput, setDiagInput] = useState('');
 
   useEffect(() => {
     if (visible) {
@@ -48,8 +56,40 @@ export function SettingsModal({
       setPin(currentPin);
       setShowPin(false);
       setHealth(null);
+      setSecretTapCount(0);
+      setDiagOpen(false);
+      setDiagInput('');
     }
   }, [visible, currentUrl, currentPin]);
+
+  const handleHeaderSecretTap = () => {
+    setSecretTapCount((prev) => {
+      const next = prev + 1;
+      if (next >= 7) {
+        setDiagOpen(true);
+        return 0;
+      }
+      return next;
+    });
+  };
+
+  const handleDiagSubmit = () => {
+    if (vaultUnlocked) {
+      onToggleVault?.(false);
+      setDiagOpen(false);
+      setDiagInput('');
+      onClose();
+      return;
+    }
+    if (verifyVaultCode(diagInput)) {
+      onToggleVault?.(true);
+      setDiagOpen(false);
+      setDiagInput('');
+      onClose();
+    } else {
+      setDiagInput('');
+    }
+  };
 
   const handleTest = async () => {
     const normalized = normalizeInputUrl(url);
@@ -72,10 +112,14 @@ export function SettingsModal({
       <View style={styles.backdrop}>
         <View style={styles.card}>
           <View style={styles.header}>
-            <View style={styles.titleRow}>
+            <TouchableOpacity
+              style={styles.titleRow}
+              activeOpacity={1}
+              onPress={handleHeaderSecretTap}
+            >
               <Ionicons name="server-outline" size={20} color="#818cf8" />
               <Text style={styles.title}>Configurar Backend</Text>
-            </View>
+            </TouchableOpacity>
             <TouchableOpacity onPress={onClose} style={styles.closeBtn}>
               <Ionicons name="close" size={22} color="#a1a1aa" />
             </TouchableOpacity>
@@ -143,6 +187,37 @@ export function SettingsModal({
               </TouchableOpacity>
             </View>
           </View>
+
+          {diagOpen && (
+            <View style={styles.inputGroup}>
+              <Text style={styles.label}>
+                {vaultUnlocked ? 'Módulo adicional activo' : 'Código de diagnóstico'}
+              </Text>
+              {vaultUnlocked ? (
+                <TouchableOpacity style={styles.testBtn} onPress={handleDiagSubmit}>
+                  <Text style={styles.testBtnText}>Ocultar módulo ahora</Text>
+                </TouchableOpacity>
+              ) : (
+                <View style={styles.pinInputWrap}>
+                  <TextInput
+                    style={styles.pinInput}
+                    value={diagInput}
+                    onChangeText={setDiagInput}
+                    placeholder="Ingresa secuencia..."
+                    placeholderTextColor="#71717a"
+                    secureTextEntry
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    returnKeyType="done"
+                    onSubmitEditing={handleDiagSubmit}
+                  />
+                  <TouchableOpacity onPress={handleDiagSubmit} style={styles.eyeBtn}>
+                    <Ionicons name="arrow-forward-circle" size={22} color="#818cf8" />
+                  </TouchableOpacity>
+                </View>
+              )}
+            </View>
+          )}
 
           {health && (
             <View

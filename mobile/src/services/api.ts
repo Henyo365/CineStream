@@ -144,11 +144,19 @@ export async function extractMediaFromUrl(
   return data;
 }
 
+export type SearchSourceFilter =
+  | 'all'
+  | 'animeflv'
+  | 'jkanime'
+  | 'hackstore'
+  | 'leercapitulo'
+  | 'ext_comic';
+
 export async function globalSearchMedia(
   backendUrl: string,
   query: string,
   pin?: string,
-  source: 'all' | 'animeflv' | 'hackstore' = 'all',
+  source: SearchSourceFilter = 'all',
 ): Promise<ExtractionResult> {
   const base = normalizeBackendUrl(backendUrl);
   const headers: Record<string, string> = {};
@@ -232,7 +240,7 @@ export async function resolveVideoBatch(
       {
         method: 'POST',
         headers,
-        body: JSON.stringify({ urls: urls.slice(0, 6) }),
+        body: JSON.stringify({ urls: urls.slice(0, 10) }),
       },
       12_000,
     );

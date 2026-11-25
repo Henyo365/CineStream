@@ -6,6 +6,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  AppState,
   BackHandler,
   FlatList,
   Image,
@@ -22,6 +23,7 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
+import { MangaReaderView } from './src/components/MangaReaderView';
 import { MediaViewerModal } from './src/components/MediaViewerModal';
 import { ServerPickerModal } from './src/components/ServerPickerModal';
 import { SettingsModal } from './src/components/SettingsModal';
@@ -31,6 +33,7 @@ import {
   globalSearchMedia,
   resolveVideoBatch,
   type ResolvedVideoResponse,
+  type SearchSourceFilter,
 } from './src/services/api';
 import {
   addHistoryEntry,
@@ -66,7 +69,13 @@ import {
   groupDownloadsByAnime,
   loadDownloadedEpisodes,
 } from './src/services/downloads';
-import { FIXED_SOURCES, type FixedSource } from './src/sources';
+import {
+  buildVaultSource,
+  FIXED_SOURCES,
+  isVaultUrl,
+  verifyVaultCode,
+  type FixedSource,
+} from './src/sources';
 import type {
   ActiveDownloadState,
   DownloadedEpisode,
@@ -78,6 +87,19 @@ import type {
 
 type BottomTab = 'home' | 'servers' | 'downloads' | 'favorites' | 'history';
 type MediaFilterTab = 'videos' | 'images' | 'pdfs' | 'pages';
+
+function isMangaContext(url?: string, adapter?: string): boolean {
+  if (adapter === 'leercapitulo' || adapter === 'ext-comic') return true;
+  if (!url) return false;
+  const lower = url.toLowerCase();
+  return (
+    lower.includes('leercapitulo.') ||
+    lower.includes('/leer/') ||
+    lower.includes('/view_uploads/') ||
+    lower.includes('/library/') ||
+    isVaultUrl(lower)
+  );
+}
 
 function extractNumericOrder(page: PageLink): number | null {
   const source = `${page.title} ${page.subtitle ?? ''} ${page.url}`;
@@ -126,9 +148,9 @@ function MainScreen() {
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchInput, setSearchInput] = useState('');
   const [recentSearches, setRecentSearches] = useState<string[]>([]);
-  const [searchSourceFilter, setSearchSourceFilter] = useState<'all' | 'animeflv' | 'hackstore'>(
-    'all',
-  );
+  const [searchSourceFilter, setSearchSourceFilter] = useState<SearchSourceFilter>('all');
+  const [vaultUnlocked, setVaultUnlocked] = useState(false);
+  const vaultSource = useMemo(() => buildVaultSource(), []);
   const [genresOpen, setGenresOpen] = useState(false);
   const [customUrlInput, setCustomUrlInput] = useState('');
 
@@ -268,7 +290,9 @@ function MainScreen() {
     bUrl: string,
     pinVal: string,
   ) => {
-    const missingFavs = favList.filter((f) => !f.thumbnail).slice(0, 6);
+    const missingFavs = favList
+      .filter((f) => !f.thumbnail && !isVaultUrl(f.url))
+      .slice(0, 6);
     if (missingFavs.length > 0) {
       const updatedFavs = [...favList];
       let changed = false;
@@ -291,7 +315,9 @@ function MainScreen() {
       }
     }
 
-    const missingCw = cwList.filter((c) => !c.thumbnail).slice(0, 5);
+    const missingCw = cwList
+      .filter((c) => !c.thumbnail && !isVaultUrl(c.url))
+      .slice(0, 5);
     if (missingCw.length > 0) {
       await Promise.allSettled(
         missingCw.map(async (cw) => {
@@ -326,6 +352,28 @@ function MainScreen() {
       pinOverride: newPin,
       silentHistory: true,
     });
+  };
+
+  const handleToggleVault = (unlock: boolean) => {
+    if (unlock) {
+      setVaultUnlocked(true);
+      setActiveSource(vaultSource);
+      setGenresOpen(false);
+      setBottomTab('home');
+      void loadUrl(vaultSource.url, { silentHistory: true });
+      return;
+    }
+    setVaultUnlocked(false);
+    if (searchSourceFilter === 'ext_comic') {
+      setSearchSourceFilter('all');
+    }
+    setNavStack((prev) => prev.filter((r) => !isVaultUrl(r.metadata.sourceUrl)));
+    if (activeSource.hidden || isVaultUrl(result?.metadata.sourceUrl)) {
+      const fallback = FIXED_SOURCES[0];
+      setActiveSource(fallback);
+      setGenresOpen(false);
+      void loadUrl(fallback.url, { silentHistory: true });
+    }
   };
 
   const loadUrl = async (
@@ -397,6 +445,26 @@ function MainScreen() {
     }
   };
 
+  const toggleVaultRef = useRef(handleToggleVault);
+  toggleVaultRef.current = handleToggleVault;
+
+  // Auto-hide vault if app stays in background > 90s on mobile
+  useEffect(() => {
+    if (Platform.OS === 'web' || !vaultUnlocked) return;
+    let bgSince: number | null = null;
+    const sub = AppState.addEventListener('change', (nextState) => {
+      if (nextState === 'background') {
+        bgSince = Date.now();
+      } else if (nextState === 'active' && bgSince !== null) {
+        if (Date.now() - bgSince > 90_000) {
+          toggleVaultRef.current(false);
+        }
+        bgSince = null;
+      }
+    });
+    return () => sub.remove();
+  }, [vaultUnlocked]);
+
   const openServerPickerForUrl = async (
     episodeUrl: string,
     title?: string,
@@ -449,6 +517,63 @@ function MainScreen() {
       );
     } finally {
       setPickerLoading(false);
+    }
+  };
+
+  const openMangaForLink = async (link: PageLink) => {
+    const reqId = ++requestIdRef.current;
+    setActionTarget(null);
+    setLoading(true);
+    setError(null);
+    setEpisodeFilter('');
+    try {
+      const firstData = await extractMediaFromUrl(backendUrl, link.url, { pin: accessPin });
+      if (reqId !== requestIdRef.current) return;
+
+      if (firstData.images.some((img) => img.sourceTag === 'manga-page')) {
+        if (result) {
+          setNavStack((prev) => [...prev, result]);
+          if (Platform.OS === 'web' && typeof globalThis.window !== 'undefined') {
+            globalThis.window.history.pushState({ youanimeStep: true }, '');
+          }
+        }
+        setResult(firstData);
+        setBottomTab('home');
+        return;
+      }
+
+      const chapPages = firstData.pages ?? [];
+      if (chapPages.length > 0) {
+        const desc = detectPagesDescending(chapPages);
+        const chrono = desc ? [...chapPages].reverse() : chapPages;
+        const targetChap = chrono.find((c) => !watchedUrls.includes(c.url)) ?? chrono[0];
+        if (targetChap) {
+          const readerData = await extractMediaFromUrl(backendUrl, targetChap.url, {
+            pin: accessPin,
+          });
+          if (reqId !== requestIdRef.current) return;
+          setNavStack((prev) => [...prev, ...(result ? [result] : []), firstData]);
+          if (Platform.OS === 'web' && typeof globalThis.window !== 'undefined') {
+            globalThis.window.history.pushState({ youanimeStep: true }, '');
+          }
+          setResult(readerData);
+          setBottomTab('home');
+          return;
+        }
+      }
+
+      if (result) {
+        setNavStack((prev) => [...prev, result]);
+      }
+      setResult(firstData);
+      setSynopsisExpanded(false);
+    } catch (err) {
+      if (reqId !== requestIdRef.current) return;
+      setError(err instanceof Error ? err.message : 'No se pudo abrir el capítulo');
+    } finally {
+      if (reqId === requestIdRef.current) {
+        setLoading(false);
+      }
     }
   };
 
@@ -770,17 +895,25 @@ function MainScreen() {
 
   const handleGlobalSearch = async (
     queryOverride?: string,
-    sourceOverride?: 'all' | 'animeflv' | 'hackstore',
+    sourceOverride?: SearchSourceFilter,
   ) => {
     const q = (queryOverride ?? searchInput).trim();
     if (!q) return;
+    if (verifyVaultCode(q)) {
+      setSearchInput('');
+      Keyboard.dismiss();
+      handleToggleVault(!vaultUnlocked);
+      return;
+    }
     const srcFilter = sourceOverride ?? searchSourceFilter;
     const reqId = ++requestIdRef.current;
     Keyboard.dismiss();
     setLoading(true);
     setError(null);
     setEpisodeFilter('');
-    void addRecentSearch(q).then(setRecentSearches);
+    if (!activeSource.hidden && srcFilter !== 'ext_comic') {
+      void addRecentSearch(q).then(setRecentSearches);
+    }
     try {
       const data = await globalSearchMedia(backendUrl, q, accessPin, srcFilter);
       if (reqId !== requestIdRef.current) return;
@@ -805,10 +938,18 @@ function MainScreen() {
   const handleSearchSubmit = (queryOverride?: string) => {
     const q = (queryOverride ?? searchInput).trim();
     if (!q) return;
+    if (verifyVaultCode(q)) {
+      setSearchInput('');
+      Keyboard.dismiss();
+      handleToggleVault(!vaultUnlocked);
+      return;
+    }
     if (/^https?:\/\//i.test(q)) {
       void loadUrl(q, { pushHistory: true });
     } else if (activeSource.searchUrlTemplate) {
-      void addRecentSearch(q).then(setRecentSearches);
+      if (!activeSource.hidden) {
+        void addRecentSearch(q).then(setRecentSearches);
+      }
       const searchUrl = activeSource.searchUrlTemplate.replace('{q}', encodeURIComponent(q));
       void loadUrl(searchUrl, { pushHistory: true });
     } else {
@@ -851,32 +992,80 @@ function MainScreen() {
     setFavorites(next);
   };
 
-  // Detect whether current result is a Catalog Grid, Detail screen, or Generic Media page
-  const viewMode = useMemo<'catalog' | 'detail' | 'generic'>(() => {
+  const visibleSources = useMemo(
+    () => [
+      ...FIXED_SOURCES,
+      ...(vaultUnlocked ? [vaultSource] : []),
+      ...customSources.filter((s) => vaultUnlocked || !isVaultUrl(s.url)),
+    ],
+    [vaultUnlocked, vaultSource, customSources],
+  );
+
+  const visibleFavorites = useMemo(
+    () => (vaultUnlocked ? favorites : favorites.filter((f) => !isVaultUrl(f.url))),
+    [favorites, vaultUnlocked],
+  );
+
+  const visibleHistory = useMemo(
+    () => (vaultUnlocked ? history : history.filter((h) => !isVaultUrl(h.url))),
+    [history, vaultUnlocked],
+  );
+
+  const visibleContinueWatching = useMemo(
+    () =>
+      vaultUnlocked
+        ? continueWatching
+        : continueWatching.filter((c) => !isVaultUrl(c.url)),
+    [continueWatching, vaultUnlocked],
+  );
+
+  // Detect whether current result is a Catalog Grid, Detail screen, Manga Reader, or Generic Media page
+  const viewMode = useMemo<'catalog' | 'detail' | 'reader' | 'generic'>(() => {
     if (!result) return 'catalog';
+    if (result.images.some((img) => img.sourceTag === 'manga-page')) {
+      return 'reader';
+    }
     const pages = result.pages ?? [];
+    const path = (() => {
+      try {
+        return new URL(result.metadata.sourceUrl).pathname;
+      } catch {
+        return '';
+      }
+    })();
+
     if (result.adapter === 'animeflv') {
-      const path = (() => {
-        try {
-          return new URL(result.metadata.sourceUrl).pathname;
-        } catch {
-          return '';
-        }
-      })();
       const isDetailUrl =
         /\/anime\/[^/]+\/?$/.test(path) || (result.videos.length > 0 && pages.length > 0);
       if (isDetailUrl) return 'detail';
       if (pages.length > 0) return 'catalog';
     }
+    if (result.adapter === 'jkanime') {
+      const cleanPath = path.replace(/^\/+|\/+$/g, '');
+      const isJkDetail =
+        result.videos.length > 0 ||
+        (pages.length > 0 &&
+          Boolean(cleanPath) &&
+          !cleanPath.includes('/') &&
+          !/^(directorio|buscar|horario|top|estrenos)$/i.test(cleanPath));
+      if (isJkDetail) return 'detail';
+      if (pages.length > 0) return 'catalog';
+    }
     if (result.adapter === 'hackstore') {
-      const path = (() => {
-        try {
-          return new URL(result.metadata.sourceUrl).pathname;
-        } catch {
-          return '';
-        }
-      })();
       if (result.videos.length > 0 || /^\/series\/[^/]+\/?$/.test(path)) {
+        return 'detail';
+      }
+      if (pages.length > 0) return 'catalog';
+    }
+    if (result.adapter === 'leercapitulo') {
+      const segs = path.replace(/^\/+|\/+$/g, '').split('/').filter(Boolean);
+      if (path.startsWith('/manga/') && segs.length >= 2) {
+        return 'detail';
+      }
+      if (pages.length > 0) return 'catalog';
+    }
+    if (result.adapter === 'ext-comic') {
+      if (path.startsWith('/library/')) {
         return 'detail';
       }
       if (pages.length > 0) return 'catalog';
@@ -1067,9 +1256,13 @@ function MainScreen() {
   };
 
   const renderPosterCard = (item: PageLink) => {
+    const refererForThumb = result?.metadata.sourceUrl?.startsWith('search://')
+      ? item.url
+      : result?.metadata.sourceUrl;
     const thumbUri = item.thumbnail
-      ? buildProxyUrl(backendUrl, item.thumbnail, result?.metadata.sourceUrl, accessPin)
+      ? buildProxyUrl(backendUrl, item.thumbnail, refererForThumb, accessPin)
       : undefined;
+    const mangaCard = isMangaContext(item.url, result?.adapter);
     return (
       <TouchableOpacity
         key={item.id}
@@ -1082,7 +1275,11 @@ function MainScreen() {
             <Image source={{ uri: thumbUri }} style={styles.posterImg} resizeMode="cover" />
           ) : (
             <View style={[styles.posterImg, styles.posterPlaceholder]}>
-              <Ionicons name="film-outline" size={28} color="#52525b" />
+              <Ionicons
+                name={mangaCard ? 'book-outline' : 'film-outline'}
+                size={28}
+                color="#52525b"
+              />
             </View>
           )}
           {item.subtitle ? (
@@ -1102,7 +1299,7 @@ function MainScreen() {
 
   const renderCatalogView = () => {
     const pages = result?.pages ?? [];
-    const allSources = [...FIXED_SOURCES, ...customSources];
+    const allSources = visibleSources;
     const isGlobalSearch = result?.adapter === 'global-search';
 
     return (
@@ -1135,7 +1332,11 @@ function MainScreen() {
                     activeOpacity={0.8}
                   >
                     <View style={[styles.sourceDot, { backgroundColor: src.color }]}>
-                      <Ionicons name="play" size={11} color="#09090b" />
+                      <Ionicons
+                        name={src.kind === 'manga' ? 'book' : 'play'}
+                        size={11}
+                        color="#09090b"
+                      />
                     </View>
                     <Text style={styles.sourcePillText}>{src.name}</Text>
                   </TouchableOpacity>
@@ -1162,7 +1363,11 @@ function MainScreen() {
                       activeOpacity={0.8}
                     >
                       <View style={[styles.sourceDot, { backgroundColor: src.color }]}>
-                        <Ionicons name="play" size={10} color="#09090b" />
+                        <Ionicons
+                          name={src.kind === 'manga' ? 'book' : 'play'}
+                          size={10}
+                          color="#09090b"
+                        />
                       </View>
                       <Text style={styles.sourcePillText}>{src.name}</Text>
                     </TouchableOpacity>
@@ -1173,6 +1378,14 @@ function MainScreen() {
           </View>
 
           <View style={styles.headerIcons}>
+            {vaultUnlocked && (
+              <TouchableOpacity
+                style={styles.headerIconBtn}
+                onPress={() => handleToggleVault(false)}
+              >
+                <Ionicons name="eye-off-outline" size={20} color="#f472b6" />
+              </TouchableOpacity>
+            )}
             {pages.length > 2 && (
               <TouchableOpacity
                 style={styles.headerIconBtn}
@@ -1297,13 +1510,22 @@ function MainScreen() {
             <Text style={styles.searchResultBanner} numberOfLines={1}>
               {result?.metadata.title} ({pages.length})
             </Text>
-            <View style={styles.searchFilterPills}>
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={styles.searchFilterPills}
+            >
               {(
                 [
                   { key: 'all', label: 'Todos' },
                   { key: 'animeflv', label: 'AnimeFLV' },
+                  { key: 'jkanime', label: 'JKAnime' },
                   { key: 'hackstore', label: 'Hackstore' },
-                ] as const
+                  { key: 'leercapitulo', label: 'LeerCapitulo' },
+                  ...(vaultUnlocked
+                    ? ([{ key: 'ext_comic', label: vaultSource.name }] as const)
+                    : []),
+                ] as { key: SearchSourceFilter; label: string }[]
               ).map((opt) => {
                 const active = searchSourceFilter === opt.key;
                 return (
@@ -1323,7 +1545,7 @@ function MainScreen() {
                   </TouchableOpacity>
                 );
               })}
-            </View>
+            </ScrollView>
           </View>
         )}
 
@@ -1399,7 +1621,7 @@ function MainScreen() {
           </View>
         )}
 
-        {continueWatching.length > 0 && navStack.length === 0 && (
+        {visibleContinueWatching.length > 0 && navStack.length === 0 && (
           <View style={[styles.cwSection, isWide && styles.wideContainer]}>
             <Text style={styles.cwHeading}>Seguir viendo</Text>
             <ScrollView
@@ -1407,7 +1629,7 @@ function MainScreen() {
               showsHorizontalScrollIndicator={false}
               contentContainerStyle={styles.cwRow}
             >
-              {continueWatching.map((cw) => {
+              {visibleContinueWatching.map((cw) => {
                 const ratio = Math.min(1, Math.max(0.05, cw.position / cw.duration));
                 const thumbUri = cw.thumbnail
                   ? buildProxyUrl(backendUrl, cw.thumbnail, cw.url, accessPin)
@@ -1604,6 +1826,7 @@ function MainScreen() {
     const allPages = result.pages ?? [];
     const relatedList = result.related ?? [];
     const genresList = result.metadata.genres ?? [];
+    const isMangaDetail = isMangaContext(result.metadata.sourceUrl, result.adapter);
     const watchedCount = allPages.filter((p) => watchedUrls.includes(p.url)).length;
     const chronologicalPages = pagesDescending ? [...allPages].reverse() : allPages;
     const nextUnwatchedEp =
@@ -1687,7 +1910,7 @@ function MainScreen() {
               {allPages.length > 0 && (
                 <View style={styles.progressSummaryWrap}>
                   <Text style={styles.progressSummaryText}>
-                    {watchedCount} / {allPages.length} vistos
+                    {watchedCount} / {allPages.length} {isMangaDetail ? 'leídos' : 'vistos'}
                   </Text>
                   <View style={styles.progressSummaryTrack}>
                     <View
@@ -1796,21 +2019,30 @@ function MainScreen() {
           );
         })()}
 
-        {/* Smart Continue / Start Next Episode CTA */}
+        {/* Smart Continue / Start Next Episode or Chapter CTA */}
         {result.videos.length === 0 && nextUnwatchedEp && (
           <TouchableOpacity
             style={styles.watchNowBtn}
-            onPress={() =>
+            onPress={() => {
+              if (isMangaDetail) {
+                void loadUrl(nextUnwatchedEp.url, { pushHistory: true });
+                return;
+              }
               void openServerPickerForUrl(
                 nextUnwatchedEp.url,
                 nextUnwatchedEp.title,
                 nextUnwatchedEp.thumbnail || result.metadata.poster,
-              )
-            }
+              );
+            }}
           >
-            <Ionicons name="play-circle" size={21} color="#ffffff" />
+            <Ionicons
+              name={isMangaDetail ? 'book' : 'play-circle'}
+              size={21}
+              color="#ffffff"
+            />
             <Text style={styles.watchNowText} numberOfLines={1}>
-              {watchedCount > 0 ? 'Continuar' : 'Ver'}: {nextUnwatchedEp.title}
+              {watchedCount > 0 ? 'Continuar' : isMangaDetail ? 'Leer' : 'Ver'}:{' '}
+              {nextUnwatchedEp.title}
             </Text>
           </TouchableOpacity>
         )}
@@ -1833,15 +2065,17 @@ function MainScreen() {
           </View>
         ) : null}
 
-        {/* Episodios */}
+        {/* Episodios / Capítulos */}
         {allPages.length > 0 && (
           <View style={styles.episodesSection}>
             <View style={styles.episodesHeaderRow}>
               <View>
                 <Text style={styles.detailSectionTitle}>
-                  Episodios ({sortedEpisodes.length})
+                  {isMangaDetail ? 'Capítulos' : 'Episodios'} ({sortedEpisodes.length})
                 </Text>
-                <Text style={styles.epHintText}>Mantén pulsado para marcar como visto</Text>
+                <Text style={styles.epHintText}>
+                  Mantén pulsado para marcar como {isMangaDetail ? 'leído' : 'visto'}
+                </Text>
               </View>
               <View style={styles.episodesControlsRow}>
                 <TextInput
@@ -1884,6 +2118,10 @@ function MainScreen() {
                     <TouchableOpacity
                       style={styles.episodeMainTap}
                       onPress={() => {
+                        if (isMangaDetail) {
+                          void loadUrl(ep.url, { pushHistory: true });
+                          return;
+                        }
                         setOfflineQueue([]);
                         void openServerPickerForUrl(
                           ep.url,
@@ -1897,7 +2135,13 @@ function MainScreen() {
                       activeOpacity={0.75}
                     >
                       <Ionicons
-                        name={watched ? 'checkmark-circle' : 'play-circle-outline'}
+                        name={
+                          watched
+                            ? 'checkmark-circle'
+                            : isMangaDetail
+                              ? 'book-outline'
+                              : 'play-circle-outline'
+                        }
                         size={22}
                         color={watched ? '#4ade80' : '#cbd5e1'}
                       />
@@ -1912,42 +2156,44 @@ function MainScreen() {
                       </Text>
                     </TouchableOpacity>
 
-                    <TouchableOpacity
-                      style={[
-                        styles.episodeDownloadBtn,
-                        activeDl && styles.episodeDownloadBtnActive,
-                        savedDl && styles.episodeDownloadBtnDone,
-                      ]}
-                      onPress={() =>
-                        void handleStartDownload({
-                          episodeUrl: ep.url,
-                          episodeTitle: ep.title,
-                          episodeNumber: extractNumericOrder(ep),
-                          animeUrl: result.metadata.sourceUrl,
-                          animeTitle: result.metadata.title,
-                          animeThumbnail: result.metadata.poster || ep.thumbnail,
-                        })
-                      }
-                      hitSlop={{ top: 8, bottom: 8, left: 6, right: 8 }}
-                      activeOpacity={0.75}
-                    >
-                      {activeDl ? (
-                        <View style={styles.epDlProgressRow}>
-                          <ActivityIndicator size="small" color="#c7d2fe" />
-                          <Text style={styles.epDlProgressText}>
-                            {activeDl.phase === 'resolving'
-                              ? '...'
-                              : activeDl.phase === 'preparing'
-                                ? `${activeDl.progress}%`
-                                : `${activeDl.progress}%`}
-                          </Text>
-                        </View>
-                      ) : savedDl ? (
-                        <Ionicons name="cloud-done" size={19} color="#34d399" />
-                      ) : (
-                        <Ionicons name="download-outline" size={19} color="#cbd5e1" />
-                      )}
-                    </TouchableOpacity>
+                    {!isMangaDetail && (
+                      <TouchableOpacity
+                        style={[
+                          styles.episodeDownloadBtn,
+                          activeDl && styles.episodeDownloadBtnActive,
+                          savedDl && styles.episodeDownloadBtnDone,
+                        ]}
+                        onPress={() =>
+                          void handleStartDownload({
+                            episodeUrl: ep.url,
+                            episodeTitle: ep.title,
+                            episodeNumber: extractNumericOrder(ep),
+                            animeUrl: result.metadata.sourceUrl,
+                            animeTitle: result.metadata.title,
+                            animeThumbnail: result.metadata.poster || ep.thumbnail,
+                          })
+                        }
+                        hitSlop={{ top: 8, bottom: 8, left: 6, right: 8 }}
+                        activeOpacity={0.75}
+                      >
+                        {activeDl ? (
+                          <View style={styles.epDlProgressRow}>
+                            <ActivityIndicator size="small" color="#c7d2fe" />
+                            <Text style={styles.epDlProgressText}>
+                              {activeDl.phase === 'resolving'
+                                ? '...'
+                                : activeDl.phase === 'preparing'
+                                  ? `${activeDl.progress}%`
+                                  : `${activeDl.progress}%`}
+                            </Text>
+                          </View>
+                        ) : savedDl ? (
+                          <Ionicons name="cloud-done" size={19} color="#34d399" />
+                        ) : (
+                          <Ionicons name="download-outline" size={19} color="#cbd5e1" />
+                        )}
+                      </TouchableOpacity>
+                    )}
                   </View>
                 );
               })}
@@ -1998,6 +2244,54 @@ function MainScreen() {
           </View>
         )}
       </ScrollView>
+    );
+  };
+
+  const renderReaderView = () => {
+    if (!result) return null;
+    const parentManga = navStack.length > 0 ? navStack[navStack.length - 1] : null;
+    const chapters =
+      result.pages && result.pages.length > 0 ? result.pages : (parentManga?.pages ?? []);
+    const curIdx = chapters.findIndex((c) => c.url === result.metadata.sourceUrl);
+    const chaptersDesc = detectPagesDescending(chapters);
+    const prevIdx = chaptersDesc ? curIdx + 1 : curIdx - 1;
+    const nextIdx = chaptersDesc ? curIdx - 1 : curIdx + 1;
+    const hasPrev = curIdx >= 0 && prevIdx >= 0 && prevIdx < chapters.length;
+    const hasNext = curIdx >= 0 && nextIdx >= 0 && nextIdx < chapters.length;
+
+    return (
+      <MangaReaderView
+        title={result.metadata.title}
+        images={result.images}
+        backendUrl={backendUrl}
+        accessPin={accessPin}
+        referer={result.metadata.sourceUrl}
+        infoUrl={result.metadata.infoUrl}
+        chapters={chapters}
+        currentChapterUrl={result.metadata.sourceUrl}
+        hasPrev={hasPrev}
+        hasNext={hasNext}
+        onPrev={() => {
+          const prevChap = chapters[prevIdx];
+          if (prevChap) void loadUrl(prevChap.url, { preserveStack: true });
+        }}
+        onNext={() => {
+          const nextChap = chapters[nextIdx];
+          if (nextChap) void loadUrl(nextChap.url, { preserveStack: true });
+        }}
+        onSelectChapter={(chap) => {
+          void loadUrl(chap.url, { preserveStack: true });
+        }}
+        onOpenInfo={() => {
+          if (result.metadata.infoUrl) {
+            void loadUrl(result.metadata.infoUrl, { pushHistory: true });
+          }
+        }}
+        onMarkRead={() => {
+          void markEpisodeWatched(result.metadata.sourceUrl).then(setWatchedUrls);
+        }}
+        onBack={() => handleGoBack()}
+      />
     );
   };
 
@@ -2112,7 +2406,7 @@ function MainScreen() {
       </View>
 
       <Text style={styles.tabSectionLabel}>FUENTES FIJAS</Text>
-      {[...FIXED_SOURCES, ...customSources].map((src) => {
+      {visibleSources.map((src) => {
         const isCurrent = activeSource.id === src.id;
         const isCustom = src.id.startsWith('custom-');
         return (
@@ -2125,7 +2419,7 @@ function MainScreen() {
             }}
           >
             <View style={[styles.fixedSourceIcon, { backgroundColor: src.color }]}>
-              <Ionicons name="tv" size={20} color="#09090b" />
+              <Ionicons name={src.kind === 'manga' ? 'book' : 'tv'} size={20} color="#09090b" />
             </View>
             <View style={styles.flex1}>
               <Text style={styles.fixedSourceName}>{src.name}</Text>
@@ -2444,7 +2738,7 @@ function MainScreen() {
   };
 
   const renderSavedListTab = (mode: 'favorites' | 'history') => {
-    const rawList = mode === 'favorites' ? favorites : history;
+    const rawList = mode === 'favorites' ? visibleFavorites : visibleHistory;
     const q = savedSearchQuery.trim().toLowerCase();
     const list = q
       ? rawList.filter((item) => item.title.toLowerCase().includes(q))
@@ -2455,10 +2749,10 @@ function MainScreen() {
         <View style={[styles.tabPageHeader, isWide && styles.wideContainer]}>
           <Text style={styles.tabPageTitle}>
             {mode === 'favorites'
-              ? `Favoritos (${favorites.length})`
-              : `Historial (${history.length})`}
+              ? `Favoritos (${visibleFavorites.length})`
+              : `Historial (${visibleHistory.length})`}
           </Text>
-          {mode === 'history' && history.length > 0 && (
+          {mode === 'history' && visibleHistory.length > 0 && (
             <TouchableOpacity
               onPress={() => {
                 void clearHistory();
@@ -2579,17 +2873,24 @@ function MainScreen() {
     return favorites.some((f) => f.url === actionTarget.url);
   }, [actionTarget, favorites]);
 
+  const isActionTargetManga = useMemo(
+    () => (actionTarget ? isMangaContext(actionTarget.url, result?.adapter) : false),
+    [actionTarget, result],
+  );
+
   return (
     <SafeAreaView style={styles.container} edges={['top', 'left', 'right']}>
       <StatusBar style="light" />
 
       <View style={styles.flex1}>
         {bottomTab === 'home' &&
-          (viewMode === 'detail'
-            ? renderDetailView()
-            : viewMode === 'generic'
-              ? renderGenericView()
-              : renderCatalogView())}
+          (viewMode === 'reader'
+            ? renderReaderView()
+            : viewMode === 'detail'
+              ? renderDetailView()
+              : viewMode === 'generic'
+                ? renderGenericView()
+                : renderCatalogView())}
         {bottomTab === 'servers' && renderServersTab()}
         {bottomTab === 'downloads' && renderDownloadsTab()}
         {bottomTab === 'favorites' && renderSavedListTab('favorites')}
@@ -2605,7 +2906,8 @@ function MainScreen() {
         )}
       </View>
 
-      {/* Bottom Navigation Bar */}
+      {/* Bottom Navigation Bar (hidden during fullscreen manga reading) */}
+      {!(bottomTab === 'home' && viewMode === 'reader') && (
       <SafeAreaView edges={['bottom']} style={styles.bottomBar}>
         {(
           (Platform.OS === 'web'
@@ -2656,6 +2958,7 @@ function MainScreen() {
           );
         })}
       </SafeAreaView>
+      )}
 
       {/* Quick Action Menu ("Ver" / "Información" / "Favoritos") */}
       <Modal
@@ -2676,17 +2979,24 @@ function MainScreen() {
             <TouchableOpacity
               style={styles.actionRow}
               onPress={() => {
-                if (actionTarget) {
-                  void openServerPickerForUrl(
-                    actionTarget.url,
-                    actionTarget.title,
-                    actionTarget.thumbnail,
-                  );
+                if (!actionTarget) return;
+                if (isActionTargetManga) {
+                  void openMangaForLink(actionTarget);
+                  return;
                 }
+                void openServerPickerForUrl(
+                  actionTarget.url,
+                  actionTarget.title,
+                  actionTarget.thumbnail,
+                );
               }}
             >
-              <Ionicons name="eye-outline" size={20} color="#f1f5f9" />
-              <Text style={styles.actionText}>Ver</Text>
+              <Ionicons
+                name={isActionTargetManga ? 'book-outline' : 'eye-outline'}
+                size={20}
+                color="#f1f5f9"
+              />
+              <Text style={styles.actionText}>{isActionTargetManga ? 'Leer' : 'Ver'}</Text>
             </TouchableOpacity>
             <TouchableOpacity
               style={styles.actionRow}
@@ -2783,6 +3093,8 @@ function MainScreen() {
         visible={settingsVisible}
         currentUrl={backendUrl}
         currentPin={accessPin}
+        vaultUnlocked={vaultUnlocked}
+        onToggleVault={handleToggleVault}
         onSave={(newUrl, newPin) => void handleSaveBackendUrl(newUrl, newPin)}
         onClose={() => setSettingsVisible(false)}
       />

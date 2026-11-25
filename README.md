@@ -1,6 +1,13 @@
-# CineStream v2.0.0
+# CineStream v2.2.0
 
-Aplicación personal para ver **animes, películas y series** en HD desde Android o Web, impulsada por un **motor nativo en Rust** (`cinestream-engine`) de alto rendimiento para búsqueda inteligente, extracción paralela, verificación de servidores y proxy streaming sin anuncios.
+Aplicación personal para ver **animes, películas, series y mangas** en HD sin anuncios desde Android o Web, impulsada por un **motor nativo en Rust** (`cinestream-engine`) de alto rendimiento para búsqueda inteligente, extracción paralela, verificación de servidores, descargas offline y proxy streaming sin publicidad.
+
+## Novedades v2.2.0
+
+- **JKAnime integrado**: catálogo de episodios recientes, directorio completo, filtros de géneros, ficha con puntuación y resolución directa de servidores **JKPlayer HD** (*Magi* / *Desu*) y servidores externos sin anuncios.
+- **LeerCapitulo + Lector de Manga en cascada**: lectura fluida a pantalla completa con zoom, selector rápido de capítulos dentro del lector, marcado automático de capítulos leídos y navegación *Anterior / Siguiente*.
+- **Descargas offline MP4** agrupadas por serie en Android y descarga directa en PC Web.
+- **Verificación paralela de hasta 10 servidores** (`/api/resolve-batch`) y mejoras de compatibilidad anti-hotlink en `/api/proxy`.
 
 ## Novedades v2.0.0
 

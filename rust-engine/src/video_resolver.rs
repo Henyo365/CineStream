@@ -111,6 +111,20 @@ pub fn extract_direct_stream_from_text(text: &str) -> Option<(String, String)> {
         return Some((m.as_str().to_string(), "application/x-mpegURL".to_string()));
     }
 
+    // Base64-encoded HLS inside atob('...') (used by JKPlayer fallbacks)
+    static ATOB_RE: OnceLock<Regex> = OnceLock::new();
+    let atob_re =
+        ATOB_RE.get_or_init(|| Regex::new(r#"atob\(\s*['"]([A-Za-z0-9+/=]{24,})['"]\s*\)"#).unwrap());
+    for caps in atob_re.captures_iter(&normalized) {
+        if let Some(bytes) = decode_b64_flexible(&caps[1]) {
+            if let Ok(decoded_str) = String::from_utf8(bytes) {
+                if let Some(m) = m3u8.find(&decoded_str) {
+                    return Some((m.as_str().to_string(), "application/x-mpegURL".to_string()));
+                }
+            }
+        }
+    }
+
     static OG_VIDEO_RE: OnceLock<Regex> = OnceLock::new();
     let og_v = OG_VIDEO_RE.get_or_init(|| {
         Regex::new(r#"(?i)<meta[^>]+property=["']og:video(?::secure_url)?["'][^>]+content=["'](https?://[^"']+\.mp4[^"']*)["']"#).unwrap()
@@ -325,6 +339,43 @@ async fn resolve_uncached(
             .unwrap()
     });
 
+    // jkanime.net/jkplayer/* (umv, um, c1): extract direct HLS or follow nested embed iframe
+    if host.contains("jkanime.net") && target.path().contains("/jkplayer/") && depth < 2 {
+        if let Ok(resp) = client
+            .get(&url_str)
+            .header("User-Agent", DEFAULT_UA)
+            .header("Referer", "https://jkanime.net/")
+            .timeout(Duration::from_secs(12))
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                if let Ok(html) = resp.text().await {
+                    if let Some((stream_url, mime_type)) = extract_direct_stream_from_text(&html) {
+                        return Ok(ResolvedVideo {
+                            stream_url,
+                            referer: Some("https://jkanime.net/".to_string()),
+                            mime_type: Some(mime_type),
+                            is_embed: false,
+                            subtitles: None,
+                            unavailable_reason: None,
+                        });
+                    }
+                    static JK_IFRAME_RE: OnceLock<Regex> = OnceLock::new();
+                    let jk_iframe = JK_IFRAME_RE.get_or_init(|| {
+                        Regex::new(r#"(?i)<iframe[^>]+src=["'](https?://[^"']+)["']"#).unwrap()
+                    });
+                    if let Some(caps) = jk_iframe.captures(&html) {
+                        let nested = caps[1].to_string();
+                        if nested != url_str {
+                            return resolve_video_stream(client, cache, nested, depth + 1).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // hackstore.fo/play.php
     if host.contains("hackstore.") && target.path().contains("play.php") && depth < 2 {
         if let Ok(resp) = client
@@ -469,14 +520,14 @@ async fn resolve_uncached(
     })
 }
 
-/// Resolves up to 6 video server URLs concurrently so the app instantly knows which servers
+/// Resolves up to 10 video server URLs concurrently so the app instantly knows which servers
 /// are native HD streams vs dead/deleted vs embed fallback!
 pub async fn resolve_batch(
     client: &Client,
     cache: &Cache<String, ResolvedVideo>,
     urls: Vec<String>,
 ) -> HashMap<String, ResolvedVideo> {
-    let limited: Vec<String> = urls.into_iter().take(6).collect();
+    let limited: Vec<String> = urls.into_iter().take(10).collect();
     let futs = limited.into_iter().map(|u| async move {
         let resolved = tokio::time::timeout(
             Duration::from_secs(9),

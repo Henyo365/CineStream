@@ -177,6 +177,13 @@ pub async fn proxy_handler(
         || lower_path.ends_with(".m4s")
         || lower_path.ends_with(".mp4")
         || lower_path.ends_with(".webm");
+    let is_likely_image = lower_path.ends_with(".jpg")
+        || lower_path.ends_with(".jpeg")
+        || lower_path.ends_with(".png")
+        || lower_path.ends_with(".webp")
+        || lower_path.ends_with(".gif")
+        || lower_path.ends_with(".avif")
+        || lower_path.contains("/covers/");
 
     if target_host.contains("zilla-networks.com") {
         let origin = target_url.origin().ascii_serialization();
@@ -184,6 +191,15 @@ pub async fn proxy_handler(
     } else if let Some(ref_raw) = q.referer.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         if let Ok(ref_url) = validate_target_url(ref_raw) {
             valid_referer = Some(ref_url.to_string());
+        }
+    }
+    if valid_referer.is_none() {
+        if target_host.contains("jkdesa.com") || target_host.contains("playmudos.com") {
+            valid_referer = Some("https://jkanime.net/".to_string());
+        } else if target_host.contains("t34798ndc.com") || target_host.contains("leercapitulo.co") {
+            valid_referer = Some("https://www.leercapitulo.co/".to_string());
+        } else if is_likely_image {
+            valid_referer = Some(format!("{}/", target_url.origin().ascii_serialization()));
         }
     }
 
@@ -229,12 +245,20 @@ pub async fn proxy_handler(
             if let Ok(ref_url) = Url::parse(ref_str) {
                 let ref_origin = ref_url.origin().ascii_serialization();
                 let same = ref_origin == target_url.origin().ascii_serialization();
-                req_builder = req_builder
-                    .header("Referer", ref_url.as_str())
-                    .header("Origin", &ref_origin)
-                    .header("Sec-Fetch-Dest", "empty")
-                    .header("Sec-Fetch-Mode", "cors")
-                    .header("Sec-Fetch-Site", if same { "same-origin" } else { "cross-site" });
+                if is_likely_image && !is_video_segment && !is_hls_url {
+                    req_builder = req_builder
+                        .header("Referer", ref_url.as_str())
+                        .header("Sec-Fetch-Dest", "image")
+                        .header("Sec-Fetch-Mode", "no-cors")
+                        .header("Sec-Fetch-Site", if same { "same-origin" } else { "cross-site" });
+                } else {
+                    req_builder = req_builder
+                        .header("Referer", ref_url.as_str())
+                        .header("Origin", &ref_origin)
+                        .header("Sec-Fetch-Dest", "empty")
+                        .header("Sec-Fetch-Mode", "cors")
+                        .header("Sec-Fetch-Site", if same { "same-origin" } else { "cross-site" });
+                }
             }
         }
 

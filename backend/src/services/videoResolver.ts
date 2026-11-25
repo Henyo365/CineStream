@@ -243,6 +243,34 @@ async function resolveVideoStreamUncached(target: URL, depth = 0): Promise<Resol
     };
   }
 
+  // jkanime.net/jkplayer/*: extraer stream HLS directo o seguir iframe anidado
+  if (host.includes('jkanime.net') && target.pathname.includes('/jkplayer/') && depth < 2) {
+    const res = await fetch(urlStr, {
+      headers: {
+        'User-Agent': DEFAULT_UA,
+        Referer: 'https://jkanime.net/',
+      },
+      signal: AbortSignal.timeout(12000),
+    });
+
+    if (res.ok) {
+      const html = await res.text();
+      const foundDirect = extractDirectStreamFromText(html);
+      if (foundDirect) {
+        return {
+          streamUrl: foundDirect.url,
+          referer: 'https://jkanime.net/',
+          mimeType: foundDirect.mimeType,
+          isEmbed: false,
+        };
+      }
+      const nestedIframe = html.match(/<iframe[^>]+src=["'](https?:\/\/[^"']+)["']/i);
+      if (nestedIframe?.[1] && nestedIframe[1] !== urlStr) {
+        return resolveVideoStream(nestedIframe[1], depth + 1);
+      }
+    }
+  }
+
   // hackstore.fo/play.php: extraer la URL real dentro de function don()
   if (host.includes('hackstore.') && target.pathname.includes('play.php') && depth < 2) {
     const res = await fetch(urlStr, {

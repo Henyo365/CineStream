@@ -2,7 +2,7 @@
   "expo": {
     "name": "CineStream",
     "slug": "cinestream",
-    "version": "2.1.0",
+    "version": "2.2.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
@@ -13,7 +13,7 @@
     },
     "android": {
       "package": "com.cinestream.app",
-      "versionCode": 7,
+      "versionCode": 8,
       "usesCleartextTraffic": true,
       "adaptiveIcon": {
         "foregroundImage": "./assets/icon.png",

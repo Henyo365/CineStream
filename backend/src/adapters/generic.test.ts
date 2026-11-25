@@ -204,3 +204,33 @@ test('extractDirectStreamFromText handles JSON-escaped HLS URLs and og:video mp4
   assert.equal(foundMp4.url, 'https://cdn.yourupload.com/file/123.mp4');
   assert.equal(foundMp4.mimeType, 'video/mp4');
 });
+
+test('jkanimeAdapter and leercapituloAdapter extract videos, episodes, and manga pages', () => {
+  const voeB64 = Buffer.from('https://voe.sx/e/test123').toString('base64');
+  const jkEp = extractFromHtml(
+    new URL('https://jkanime.net/kaijuu-8-gou/1/'),
+    `<html><body>
+      <div id="marcar_visto" data-anime="kaijuu-8-gou" data-title="Kaijuu 8-gou" data-numero="1"></div>
+      <script>
+        var video = [];
+        video[1] = '<iframe class="player_conte" src="https://jkanime.net/jkplayer/umv?e=ABC"></iframe>';
+        var servers = [{"remote":"${voeB64}","server":"VOE","lang":1}];
+      </script>
+    </body></html>`,
+  );
+  assert.equal(jkEp.adapter, 'jkanime');
+  assert.equal(jkEp.videos.length, 2);
+  assert.equal(jkEp.metadata.infoUrl, 'https://jkanime.net/kaijuu-8-gou/');
+
+  const lcChap = extractFromHtml(
+    new URL('https://www.leercapitulo.co/leer/abc123/test-manga/10/'),
+    `<html><body>
+      <a class="lc-rbtn lc-rbtn--title" href="/manga/abc123/test-manga/">‹ Test Manga</a>
+      <select id="chapterSelect"><option value="/leer/abc123/test-manga/10/" selected>Capitulo 10</option></select>
+      <main id="lcPages"><img data-src="https://cdn.example.com/1.jpg" /></main>
+    </body></html>`,
+  );
+  assert.equal(lcChap.adapter, 'leercapitulo');
+  assert.equal(lcChap.images.length, 1);
+  assert.equal(lcChap.images[0].sourceTag, 'manga-page');
+});
