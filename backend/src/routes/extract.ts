@@ -143,7 +143,28 @@ extractRouter.get('/', (req: Request, res: Response) => {
 });
 
 extractRouter.post('/', (req: Request, res: Response) => {
-  const body = req.body as { url?: unknown; refresh?: unknown } | undefined;
+  const body = req.body as { url?: unknown; html?: unknown; refresh?: unknown } | undefined;
+  if (
+    typeof body?.url === 'string' &&
+    body.url.trim() &&
+    typeof body?.html === 'string' &&
+    body.html.trim()
+  ) {
+    try {
+      const targetUrl = validateTargetUrl(body.url);
+      const parsed = extractFromHtml(targetUrl, body.html);
+      extractCache.set(targetUrl.toString(), {
+        data: parsed,
+        expiresAt: Date.now() + CACHE_TTL_MS,
+      });
+      res.json(parsed);
+      return;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Error al procesar HTML';
+      res.status(422).json({ error: message });
+      return;
+    }
+  }
   const refresh = Boolean(body?.refresh);
   void handleExtract(body?.url, refresh, res);
 });

@@ -1,7 +1,31 @@
+import { Platform } from 'react-native';
 import type { ExtractionResult } from '../types';
 
 const DEFAULT_TIMEOUT_MS = 22_000;
 const HEALTH_TIMEOUT_MS = 7_000;
+const MOBILE_CHROME_UA =
+  'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36';
+
+// Hosts that block cloud datacenter IPs (like Railway) with HTTP 403 but allow normal residential/mobile IPs
+const clientDirectHosts = new Set<string>(['jkanime.net']);
+
+function getHostnameSafe(rawUrl: string): string {
+  try {
+    return new URL(rawUrl).hostname.toLowerCase().replace(/^www\./, '');
+  } catch {
+    return '';
+  }
+}
+
+function shouldPreferDeviceFetch(rawUrl: string): boolean {
+  if (Platform.OS === 'web') return false;
+  const host = getHostnameSafe(rawUrl);
+  if (!host) return false;
+  for (const h of clientDirectHosts) {
+    if (host === h || host.endsWith(`.${h}`)) return true;
+  }
+  return false;
+}
 
 export function normalizeBackendUrl(raw: string): string {
   return raw.trim().replace(/\/+$/, '');
@@ -121,24 +145,74 @@ export async function checkBackendHealth(
   }
 }
 
+async function extractViaDeviceFetch(
+  base: string,
+  targetUrl: string,
+  headers: Record<string, string>,
+): Promise<ExtractionResult> {
+  const pageRes = await fetchWithTimeout(
+    targetUrl,
+    {
+      method: 'GET',
+      headers: {
+        'User-Agent': MOBILE_CHROME_UA,
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
+      },
+    },
+    16_000,
+  );
+  if (!pageRes.ok) {
+    throw new Error(`La página respondió con HTTP ${pageRes.status}`);
+  }
+  const html = await pageRes.text();
+  const effectiveUrl = pageRes.url || targetUrl;
+
+  const parseRes = await fetchWithTimeout(`${base}/api/extract`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ url: effectiveUrl, html }),
+  });
+  const parsed = await parseJsonSafe<ExtractionResult & { error?: string }>(parseRes);
+  if (!parseRes.ok || !parsed) {
+    throw new Error(parsed?.error || `Error procesando página (${parseRes.status})`);
+  }
+  return parsed;
+}
+
 export async function extractMediaFromUrl(
   backendUrl: string,
   targetUrl: string,
   opts?: { refresh?: boolean; pin?: string },
 ): Promise<ExtractionResult> {
   const base = normalizeBackendUrl(backendUrl);
+  const cleanUrl = targetUrl.trim();
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (opts?.pin) headers['x-access-pin'] = opts.pin;
+
+  if (shouldPreferDeviceFetch(cleanUrl)) {
+    try {
+      return await extractViaDeviceFetch(base, cleanUrl, headers);
+    } catch {
+      // Fall back to backend extraction if direct fetch fails
+    }
+  }
 
   const res = await fetchWithTimeout(`${base}/api/extract`, {
     method: 'POST',
     headers,
-    body: JSON.stringify({ url: targetUrl.trim(), refresh: Boolean(opts?.refresh) }),
+    body: JSON.stringify({ url: cleanUrl, refresh: Boolean(opts?.refresh) }),
   });
 
   const data = await parseJsonSafe<ExtractionResult & { error?: string }>(res);
   if (!res.ok || !data) {
-    throw new Error(data?.error || `Error del servidor (${res.status})`);
+    const errMsg = data?.error || `Error del servidor (${res.status})`;
+    if (Platform.OS !== 'web' && /\b(403|503)\b/.test(errMsg)) {
+      const host = getHostnameSafe(cleanUrl);
+      if (host) clientDirectHosts.add(host);
+      return extractViaDeviceFetch(base, cleanUrl, headers);
+    }
+    throw new Error(errMsg);
   }
 
   return data;
@@ -165,18 +239,45 @@ export async function globalSearchMedia(
   const params = new URLSearchParams({ q: query.trim() });
   if (source !== 'all') params.set('source', source);
 
-  const res = await fetchWithTimeout(
-    `${base}/api/search?${params.toString()}`,
-    {
-      method: 'GET',
-      headers,
-    },
-    25_000,
-  );
+  const shouldSupplementJk =
+    Platform.OS !== 'web' && (source === 'all' || source === 'jkanime');
+  const jkSearchPromise = shouldSupplementJk
+    ? extractMediaFromUrl(
+        backendUrl,
+        `https://jkanime.net/buscar/${encodeURIComponent(query.trim())}/`,
+        { pin },
+      ).catch(() => null)
+    : Promise.resolve(null);
+
+  const [res, jkExtra] = await Promise.all([
+    fetchWithTimeout(
+      `${base}/api/search?${params.toString()}`,
+      {
+        method: 'GET',
+        headers,
+      },
+      25_000,
+    ),
+    jkSearchPromise,
+  ]);
 
   const data = await parseJsonSafe<ExtractionResult & { error?: string }>(res);
   if (!res.ok || !data) {
     throw new Error(data?.error || `Error en búsqueda (${res.status})`);
+  }
+
+  if (jkExtra && (jkExtra.pages?.length ?? 0) > 0) {
+    const existingUrls = new Set((data.pages ?? []).map((p) => p.url));
+    const extraPages = (jkExtra.pages ?? [])
+      .filter((p) => !existingUrls.has(p.url))
+      .map((p) => ({
+        ...p,
+        source: 'JKAnime',
+        subtitle: p.subtitle ? `JKAnime • ${p.subtitle}` : 'JKAnime',
+      }));
+    if (extraPages.length > 0) {
+      data.pages = [...(data.pages ?? []), ...extraPages];
+    }
   }
 
   return data;
@@ -192,8 +293,92 @@ export interface ResolvedVideoResponse {
   referer?: string;
   mimeType?: string;
   isEmbed: boolean;
+  directPlay?: boolean;
   subtitles?: SubtitleOption[];
   unavailableReason?: string;
+}
+
+function decodeBase64Ascii(b64: string): string | null {
+  try {
+    if (typeof globalThis.atob === 'function') {
+      return globalThis.atob(b64);
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+async function resolveJkPlayerOnDevice(
+  backendUrl: string,
+  targetUrl: string,
+  pin?: string,
+): Promise<ResolvedVideoResponse | null> {
+  if (Platform.OS === 'web') return null;
+  const lower = targetUrl.toLowerCase();
+  if (!lower.includes('jkanime.net/jkplayer/')) return null;
+
+  try {
+    const res = await fetchWithTimeout(
+      targetUrl,
+      {
+        method: 'GET',
+        headers: {
+          'User-Agent': MOBILE_CHROME_UA,
+          Referer: 'https://jkanime.net/',
+          Accept: 'text/html,application/xhtml+xml,*/*;q=0.8',
+        },
+      },
+      12_000,
+    );
+    if (!res.ok) return null;
+    const html = (await res.text()).replace(/\\\//g, '/');
+
+    const m3u8Match = html.match(/https?:\/\/[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*/i);
+    if (m3u8Match?.[0]) {
+      return {
+        streamUrl: m3u8Match[0],
+        referer: 'https://jkanime.net/',
+        mimeType: 'application/x-mpegURL',
+        isEmbed: false,
+        directPlay: true,
+      };
+    }
+
+    const atobMatch = html.match(/atob\(\s*['"]([A-Za-z0-9+/=]{24,})['"]\s*\)/i);
+    if (atobMatch?.[1]) {
+      const decoded = decodeBase64Ascii(atobMatch[1]);
+      const innerM3u8 = decoded?.match(/https?:\/\/[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*/i);
+      if (innerM3u8?.[0]) {
+        return {
+          streamUrl: innerM3u8[0],
+          referer: 'https://jkanime.net/',
+          mimeType: 'application/x-mpegURL',
+          isEmbed: false,
+          directPlay: true,
+        };
+      }
+    }
+
+    const mp4Match = html.match(/https?:\/\/[^\s"'<>\\]+\.mp4[^\s"'<>\\]*/i);
+    if (mp4Match?.[0]) {
+      return {
+        streamUrl: mp4Match[0],
+        referer: 'https://jkanime.net/',
+        mimeType: 'video/mp4',
+        isEmbed: false,
+        directPlay: true,
+      };
+    }
+
+    const nestedIframe = html.match(/<iframe[^>]+src=["'](https?:\/\/[^"']+)["']/i);
+    if (nestedIframe?.[1] && nestedIframe[1] !== targetUrl) {
+      return resolveVideoUrl(backendUrl, nestedIframe[1], pin);
+    }
+  } catch {
+    // ignore and fall back
+  }
+  return null;
 }
 
 export async function resolveVideoUrl(
@@ -202,6 +387,10 @@ export async function resolveVideoUrl(
   pin?: string,
   refresh = false,
 ): Promise<ResolvedVideoResponse> {
+  const cleanTarget = targetUrl.trim();
+  const deviceJk = await resolveJkPlayerOnDevice(backendUrl, cleanTarget, pin);
+  if (deviceJk) return deviceJk;
+
   const base = normalizeBackendUrl(backendUrl);
   const headers: Record<string, string> = {};
   if (pin) headers['x-access-pin'] = pin;
@@ -230,26 +419,50 @@ export async function resolveVideoBatch(
   pin?: string,
 ): Promise<Record<string, ResolvedVideoResponse>> {
   if (urls.length === 0) return {};
+  const limited = urls.slice(0, 10);
+  const jkUrls =
+    Platform.OS !== 'web'
+      ? limited.filter((u) => u.toLowerCase().includes('jkanime.net/jkplayer/'))
+      : [];
+  const backendUrls =
+    jkUrls.length > 0 ? limited.filter((u) => !jkUrls.includes(u)) : limited;
+
   const base = normalizeBackendUrl(backendUrl);
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (pin) headers['x-access-pin'] = pin;
 
-  try {
-    const res = await fetchWithTimeout(
-      `${base}/api/resolve-batch`,
-      {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ urls: urls.slice(0, 10) }),
-      },
-      12_000,
-    );
-    if (!res.ok) return {};
-    const data = await parseJsonSafe<{ results?: Record<string, ResolvedVideoResponse> }>(res);
-    return data?.results ?? {};
-  } catch {
-    return {};
-  }
+  const backendPromise = (async (): Promise<Record<string, ResolvedVideoResponse>> => {
+    if (backendUrls.length === 0) return {};
+    try {
+      const res = await fetchWithTimeout(
+        `${base}/api/resolve-batch`,
+        {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ urls: backendUrls }),
+        },
+        12_000,
+      );
+      if (!res.ok) return {};
+      const data = await parseJsonSafe<{ results?: Record<string, ResolvedVideoResponse> }>(res);
+      return data?.results ?? {};
+    } catch {
+      return {};
+    }
+  })();
+
+  const jkPromise = Promise.all(
+    jkUrls.map(async (u) => {
+      const resolved = await resolveJkPlayerOnDevice(backendUrl, u, pin);
+      return [u, resolved ?? { streamUrl: u, isEmbed: true }] as const;
+    }),
+  );
+
+  const [backendMap, jkEntries] = await Promise.all([backendPromise, jkPromise]);
+  return {
+    ...backendMap,
+    ...Object.fromEntries(jkEntries),
+  };
 }
 
 export interface DownloadJobStatus {

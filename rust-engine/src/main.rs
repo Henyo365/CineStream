@@ -9,7 +9,7 @@ mod video_resolver;
 use crate::download::DownloadManager;
 use crate::types::{ExtractionResult, MediaItem, MediaType, PageMetadata, ResolvedVideo};
 use crate::url_utils::{extract_filename, make_media_id, validate_target_url};
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -89,24 +89,35 @@ async fn fetch_and_extract_uncached(
     raw_url: &str,
 ) -> Result<ExtractionResult, String> {
     let target_url = validate_target_url(raw_url)?;
+    let origin_ref = format!("{}/", target_url.origin().ascii_serialization());
     let resp = client
         .get(target_url.as_str())
         .header("User-Agent", DEFAULT_UA)
         .header(
             "Accept",
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         )
         .header("Accept-Language", "es-ES,es;q=0.9,en;q=0.8")
+        .header("Upgrade-Insecure-Requests", "1")
+        .header("Sec-Fetch-Dest", "document")
+        .header("Sec-Fetch-Mode", "navigate")
+        .header("Sec-Fetch-Site", "none")
+        .header("Sec-Fetch-User", "?1")
+        .header("Referer", &origin_ref)
         .timeout(Duration::from_secs(15))
         .send()
         .await
         .map_err(|e| format!("Error de conexión con la página: {e}"))?;
 
     if !resp.status().is_success() {
-        return Err(format!(
-            "La página respondió con HTTP {}",
-            resp.status().as_u16()
-        ));
+        let code = resp.status().as_u16();
+        if code == 403 {
+            return Err(
+                "La página respondió con HTTP 403 (el sitio bloquea IPs de servidores en la nube como Railway; desde el APK de Android o con backend local en tu PC carga directo con tu IP residencial)."
+                    .to_string(),
+            );
+        }
+        return Err(format!("La página respondió con HTTP {code}"));
     }
 
     let final_url = resp.url().clone();
@@ -241,6 +252,7 @@ struct ExtractQuery {
 #[derive(Deserialize)]
 struct ExtractBody {
     url: Option<String>,
+    html: Option<String>,
     refresh: Option<bool>,
 }
 
@@ -279,6 +291,28 @@ async fn extract_post_handler(
                 .into_response();
         }
     };
+
+    // Hybrid client-fetched HTML mode: mobile devices on residential IPs can supply raw HTML
+    // when a target site blocks cloud datacenter IPs (HTTP 403), letting Rust parse & cache it!
+    if let Some(raw_html) = body.html.as_deref().filter(|h| !h.trim().is_empty()) {
+        let target = match validate_target_url(raw) {
+            Ok(t) => t,
+            Err(msg) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({ "error": msg })),
+                )
+                    .into_response();
+            }
+        };
+        let parsed = adapters::extract_from_html(&target, raw_html);
+        state
+            .extract_cache
+            .insert(target.to_string(), parsed.clone())
+            .await;
+        return Json(parsed).into_response();
+    }
+
     let refresh = body.refresh.unwrap_or(false);
     match extract_url_cached(&state, raw, refresh).await {
         Ok(res) => Json(res).into_response(),
@@ -441,6 +475,7 @@ async fn main() {
         .to_string();
 
     let client = Client::builder()
+        .cookie_store(true)
         .connect_timeout(Duration::from_secs(15))
         .read_timeout(Duration::from_secs(25))
         .pool_max_idle_per_host(12)
@@ -474,7 +509,12 @@ async fn main() {
     // JSON API routes WITH gzip compression
     let protected_json_api = Router::new()
         .route("/ping", get(ping_handler))
-        .route("/extract", get(extract_get_handler).post(extract_post_handler))
+        .route(
+            "/extract",
+            get(extract_get_handler)
+                .post(extract_post_handler)
+                .layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
+        )
         .route("/search", get(search_handler))
         .route("/resolve", get(resolve_handler))
         .route("/resolve-batch", post(resolve_batch_handler))

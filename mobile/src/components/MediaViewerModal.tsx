@@ -1384,6 +1384,7 @@ export function MediaViewerModal({
   const [resolvedUrl, setResolvedUrl] = useState<string | null>(null);
   const [resolvedReferer, setResolvedReferer] = useState<string | undefined>(undefined);
   const [resolvedEmbed, setResolvedEmbed] = useState<boolean>(true);
+  const [resolvedDirectPlay, setResolvedDirectPlay] = useState<boolean>(false);
   const [resolvedSubtitles, setResolvedSubtitles] = useState<SubtitleOption[] | undefined>(undefined);
   const [serverMenuOpen, setServerMenuOpen] = useState(false);
   const [nativeError, setNativeError] = useState<string | null>(null);
@@ -1430,6 +1431,7 @@ export function MediaViewerModal({
     setForceWebView(false);
     setServerMenuOpen(false);
     setNativeError(null);
+    setResolvedDirectPlay(false);
     setResolvedSubtitles(undefined);
     if (!item || item.type !== 'video') {
       setResolvedUrl(null);
@@ -1473,6 +1475,7 @@ export function MediaViewerModal({
         setResolvedUrl(res.streamUrl);
         setResolvedReferer(res.referer ?? referer);
         setResolvedEmbed(res.isEmbed);
+        setResolvedDirectPlay(Boolean(res.directPlay));
         setResolvedSubtitles(res.subtitles);
       })
       .catch(() => {
@@ -1701,7 +1704,7 @@ export function MediaViewerModal({
       return (
         <CustomNativePlayer
           key={`${item.id}-${recoveryNonce}`}
-          uri={proxiedUrl}
+          uri={resolvedDirectPlay ? activeUrl : proxiedUrl}
           isHls={isHls}
           backendUrl={backendUrl}
           accessPin={accessPin}

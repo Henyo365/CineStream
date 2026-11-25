@@ -1,6 +1,6 @@
 [package]
 name = "cinestream-engine"
-version = "2.2.0"
+version = "2.2.1"
 edition = "2021"
 description = "High-performance Rust scraping, search, video resolver and HLS proxy engine for CineStream"
 
@@ -8,7 +8,7 @@ description = "High-performance Rust scraping, search, video resolver and HLS pr
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "fs", "compression-gzip"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "brotli", "deflate", "stream", "http2"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies", "gzip", "brotli", "deflate", "stream", "http2"] }
 scraper = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -360,7 +360,12 @@ export async function downloadEpisodeMedia(
     }
   }
 
-  const orderedCandidates = [...directCandidates, ...hlsCandidates];
+  const orderedCandidates = [
+    ...directCandidates.filter((c) => !c.directPlay),
+    ...hlsCandidates.filter((c) => !c.directPlay),
+    ...directCandidates.filter((c) => c.directPlay),
+    ...hlsCandidates.filter((c) => c.directPlay),
+  ];
   if (orderedCandidates.length === 0) {
     throw new Error('Ningún servidor disponible permite descarga directa para este episodio.');
   }
