@@ -3,6 +3,7 @@ import React, { useEffect, useState } from 'react';
 import {
   ActivityIndicator,
   Modal,
+  Platform,
   StyleSheet,
   Text,
   TextInput,
@@ -133,16 +134,28 @@ export function SettingsModal({
           <View style={styles.inputGroup}>
             <View style={styles.labelRow}>
               <Text style={styles.label}>URL del servidor</Text>
-              {url !== DEFAULT_BACKEND_URL && (
-                <TouchableOpacity
-                  onPress={() => {
-                    setUrl(DEFAULT_BACKEND_URL);
-                    setHealth(null);
-                  }}
-                >
-                  <Text style={styles.resetLink}>Restablecer</Text>
-                </TouchableOpacity>
-              )}
+              <View style={{ flexDirection: 'row', gap: 12 }}>
+                {Platform.OS === 'web' && url !== 'http://localhost:3001' && (
+                  <TouchableOpacity
+                    onPress={() => {
+                      setUrl('http://localhost:3001');
+                      setHealth(null);
+                    }}
+                  >
+                    <Text style={styles.resetLink}>Motor PC (localhost)</Text>
+                  </TouchableOpacity>
+                )}
+                {url !== DEFAULT_BACKEND_URL && (
+                  <TouchableOpacity
+                    onPress={() => {
+                      setUrl(DEFAULT_BACKEND_URL);
+                      setHealth(null);
+                    }}
+                  >
+                    <Text style={styles.resetLink}>Restablecer</Text>
+                  </TouchableOpacity>
+                )}
+              </View>
             </View>
             <TextInput
               style={styles.input}

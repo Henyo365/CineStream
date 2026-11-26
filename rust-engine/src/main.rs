@@ -89,13 +89,12 @@ async fn fetch_and_extract_uncached(
     raw_url: &str,
 ) -> Result<ExtractionResult, String> {
     let target_url = validate_target_url(raw_url)?;
-    let origin_ref = format!("{}/", target_url.origin().ascii_serialization());
     let resp = client
         .get(target_url.as_str())
         .header("User-Agent", DEFAULT_UA)
         .header(
             "Accept",
-            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         )
         .header("Accept-Language", "es-ES,es;q=0.9,en;q=0.8")
         .header("Upgrade-Insecure-Requests", "1")
@@ -103,7 +102,6 @@ async fn fetch_and_extract_uncached(
         .header("Sec-Fetch-Mode", "navigate")
         .header("Sec-Fetch-Site", "none")
         .header("Sec-Fetch-User", "?1")
-        .header("Referer", &origin_ref)
         .timeout(Duration::from_secs(15))
         .send()
         .await
